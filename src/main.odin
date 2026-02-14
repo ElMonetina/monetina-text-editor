@@ -57,6 +57,7 @@ Config :: struct {
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 600
 FONT_PATH :: "fonts/Fira_Mono/FiraMono-Regular.ttf"
+TEXT_MARGIN :: 10.0
 
 main :: proc() {
 	// 1. Initialize SDL
@@ -82,7 +83,8 @@ main :: proc() {
 
 	// Initialize Window and Renderer
 	window_flags := sdl.WindowFlags{.RESIZABLE, .HIGH_PIXEL_DENSITY}
-	editor.window = sdl.CreateWindow("moned", WINDOW_WIDTH, WINDOW_HEIGHT, window_flags)
+	w_name := cstring("monetina-text-editor")
+	editor.window = sdl.CreateWindow(w_name, WINDOW_WIDTH, WINDOW_HEIGHT, window_flags)
 	if editor.window == nil {
 		fmt.eprintln("CreateWindow failed")
 		return
@@ -188,7 +190,7 @@ draw_selection_rects :: proc(editor: ^Editor, view_start, view_end: int) {
 		x_start := measure_line_width(editor.lines[r], c_start, editor.config)
 		x_end := measure_line_width(editor.lines[r], c_end, editor.config)
 
-		x := 10.0 - editor.scroll.x + x_start
+		x := TEXT_MARGIN - editor.scroll.x + x_start
 		width := (x_end - x_start) + extra_width
 
 		y := f32(r) * f32(editor.config.line_height) - editor.scroll.y
@@ -266,7 +268,7 @@ handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
 			click_row, click_col := screen_to_grid(editor, event.button.x, event.button.y)
 
 			if click_row != editor.cursor.row {
-				leave_line(editor)
+				leave_line(editor, editor.cursor.row)
 			}
 
 			editor.cursor.row = click_row
@@ -303,13 +305,17 @@ handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
 	}
 }
 
+next_tab_stop :: proc(x, tab_width: f32) -> f32 {
+	return f32(int(x / tab_width) + 1) * tab_width
+}
+
 screen_to_grid :: proc(editor: ^Editor, x, y: f32) -> (int, int) {
 	rel_y := y + editor.scroll.y
 	row := int(rel_y / f32(editor.config.line_height))
 	if row < 0 {row = 0}
 	if row >= len(editor.lines) {row = len(editor.lines) - 1}
 
-	rel_x := x + editor.scroll.x - 10.0 // Margin
+	rel_x := x + editor.scroll.x - TEXT_MARGIN
 
 	line := editor.lines[row]
 	current_x := f32(0.0)
@@ -318,9 +324,7 @@ screen_to_grid :: proc(editor: ^Editor, x, y: f32) -> (int, int) {
 	for i := 0; i < len(line); i += 1 {
 		char_w := editor.config.char_width
 		if line[i] == '\t' {
-			// Calculate tab width
-			next_tab := (int(current_x / tab_width_px) + 1)
-			new_x := f32(next_tab) * tab_width_px
+			new_x := next_tab_stop(current_x, tab_width_px)
 			char_w = new_x - current_x
 		}
 
@@ -339,8 +343,7 @@ measure_line_width :: proc(line: [dynamic]rune, count: int, config: Config) -> f
 
 	for i := 0; i < count && i < len(line); i += 1 {
 		if line[i] == '\t' {
-			next_tab := (int(width / tab_width_px) + 1)
-			width = f32(next_tab) * tab_width_px
+			width = next_tab_stop(width, tab_width_px)
 		} else {
 			width += config.char_width
 		}
@@ -569,10 +572,13 @@ paste_from_clipboard :: proc(editor: ^Editor) {
 }
 
 insert_text :: proc(editor: ^Editor, text: string) {
+	if len(text) == 0 {return}
+	editor.dirty = true
+
 	// Handle multiline insertion
-	// Clear selection before inserting (if any)
-	// For v0.1: just disable selection, don't delete selected text yet
-	editor.selection.active = false
+	if editor.selection.active {
+		delete_selection(editor)
+	}
 
 	lines_str := strings.split(text, "\n", context.temp_allocator)
 
@@ -600,7 +606,11 @@ insert_text :: proc(editor: ^Editor, text: string) {
 }
 
 insert_newline :: proc(editor: ^Editor) {
-	editor.selection.active = false
+	editor.dirty = true
+	if editor.selection.active {
+		delete_selection(editor)
+	}
+
 	current_line := &editor.lines[editor.cursor.row]
 
 	// Split current line at cursor.col
@@ -614,7 +624,7 @@ insert_newline :: proc(editor: ^Editor) {
 	// Insert new line after current row
 	inject_at(&editor.lines, editor.cursor.row + 1, right_part)
 
-	leave_line(editor)
+	leave_line(editor, editor.cursor.row)
 
 	editor.cursor.row += 1
 	editor.cursor.col = 0
@@ -624,12 +634,14 @@ insert_newline :: proc(editor: ^Editor) {
 
 delete_char_backwards :: proc(editor: ^Editor) {
 	if editor.cursor.col > 0 {
+		editor.dirty = true
 		// Remove char at col-1
 		line := &editor.lines[editor.cursor.row]
 		ordered_remove(line, editor.cursor.col - 1)
 		editor.cursor.col -= 1
 		editor.cursor.preferred_col = editor.cursor.col
 	} else if editor.cursor.row > 0 {
+		editor.dirty = true
 		// Merge with previous line
 		curr_line := editor.lines[editor.cursor.row]
 		prev_line := &editor.lines[editor.cursor.row - 1]
@@ -651,6 +663,7 @@ delete_char_backwards :: proc(editor: ^Editor) {
 delete_selection :: proc(editor: ^Editor) {
 	if !editor.selection.active {return}
 
+	editor.dirty = true
 	s := editor.selection.anchor
 	e := editor.cursor
 
@@ -704,11 +717,7 @@ move_cursor :: proc(editor: ^Editor, d_row, d_col: int) {
 		if editor.cursor.row >= len(editor.lines) {editor.cursor.row = len(editor.lines) - 1}
 
 		if editor.cursor.row != old_row {
-			// Restore old row temporarily to clear it
-			new_row := editor.cursor.row
-			editor.cursor.row = old_row
-			leave_line(editor)
-			editor.cursor.row = new_row
+			leave_line(editor, old_row)
 		}
 
 		// Snap to preferred column
@@ -723,6 +732,7 @@ move_cursor :: proc(editor: ^Editor, d_row, d_col: int) {
 
 		if editor.cursor.col < 0 {
 			if editor.cursor.row > 0 {
+				leave_line(editor, editor.cursor.row)
 				editor.cursor.row -= 1
 				editor.cursor.col = len(editor.lines[editor.cursor.row])
 			} else {
@@ -730,6 +740,7 @@ move_cursor :: proc(editor: ^Editor, d_row, d_col: int) {
 			}
 		} else if editor.cursor.col > line_len {
 			if editor.cursor.row < len(editor.lines) - 1 {
+				leave_line(editor, editor.cursor.row)
 				editor.cursor.row += 1
 				editor.cursor.col = 0
 			} else {
@@ -757,12 +768,13 @@ ensure_cursor_visible :: proc(editor: ^Editor) {
 	}
 
 	// Auto-Scroll X
-	cursor_x := f32(editor.cursor.col) * editor.config.char_width + 10.0
+	cursor_x := f32(editor.cursor.col) * editor.config.char_width + TEXT_MARGIN
 	if cursor_x < editor.scroll.target_x {
-		editor.scroll.target_x = cursor_x - 10.0
+		editor.scroll.target_x = cursor_x - TEXT_MARGIN
 	}
-	if cursor_x > editor.scroll.target_x + f32(w) - editor.config.char_width - 20.0 {
-		editor.scroll.target_x = cursor_x - f32(w) + editor.config.char_width + 20.0
+	if cursor_x >
+	   editor.scroll.target_x + f32(w) - editor.config.char_width - (TEXT_MARGIN * 2.0) {
+		editor.scroll.target_x = cursor_x - f32(w) + editor.config.char_width + (TEXT_MARGIN * 2.0)
 	}
 }
 
@@ -790,10 +802,10 @@ update :: proc(editor: ^Editor) {
 	if editor.scroll.target_x < 0 {editor.scroll.target_x = 0}
 }
 
-leave_line :: proc(editor: ^Editor) {
-	if editor.cursor.row < 0 || editor.cursor.row >= len(editor.lines) {return}
+leave_line :: proc(editor: ^Editor, row: int) {
+	if row < 0 || row >= len(editor.lines) {return}
 
-	line := &editor.lines[editor.cursor.row]
+	line := &editor.lines[row]
 	if len(line) == 0 {return}
 
 	// Trim trailing tabs
@@ -808,6 +820,64 @@ leave_line :: proc(editor: ^Editor) {
 
 	if new_len < len(line) {
 		resize(line, new_len)
+		editor.dirty = true
+	}
+}
+
+render_line :: proc(editor: ^Editor, line_index: int, y: f32) {
+	line := editor.lines[line_index]
+	if len(line) == 0 {return}
+
+	current_x := TEXT_MARGIN - editor.scroll.x
+	tab_width_px := f32(editor.config.tab_width) * editor.config.char_width
+
+	// Render line segment by segment
+	seg_builder: strings.Builder
+	strings.builder_init(&seg_builder, context.temp_allocator)
+
+	for r_idx := 0; r_idx < len(line); r_idx += 1 {
+		r := line[r_idx]
+		if r == '\t' {
+			// Flush segment
+			if strings.builder_len(seg_builder) > 0 {
+				text := strings.to_string(seg_builder)
+				c_text := strings.clone_to_cstring(text, context.temp_allocator)
+				text_obj := ttf.CreateText(
+					editor.text_engine,
+					editor.font,
+					c_text,
+					uint(len(text)),
+				)
+				if text_obj != nil {
+					ttf.SetTextColor(text_obj, 220, 220, 220, 255)
+					ttf.DrawRendererText(text_obj, current_x, y)
+					// text_obj is opaque, assume monospace width
+					current_x += f32(utf8.rune_count(text)) * editor.config.char_width
+					ttf.DestroyText(text_obj)
+				}
+				strings.builder_reset(&seg_builder)
+			}
+
+			// Advance tab
+			// Rel x from start of line content (ignoring scroll for alignment)
+			line_start_x := TEXT_MARGIN - editor.scroll.x
+			rel_x := current_x - line_start_x
+			current_x = line_start_x + next_tab_stop(rel_x, tab_width_px)
+		} else {
+			strings.write_rune(&seg_builder, r)
+		}
+	}
+
+	// Flush remaining
+	if strings.builder_len(seg_builder) > 0 {
+		text := strings.to_string(seg_builder)
+		c_text := strings.clone_to_cstring(text, context.temp_allocator)
+		text_obj := ttf.CreateText(editor.text_engine, editor.font, c_text, uint(len(text)))
+		if text_obj != nil {
+			ttf.SetTextColor(text_obj, 220, 220, 220, 255)
+			ttf.DrawRendererText(text_obj, current_x, y)
+			ttf.DestroyText(text_obj)
+		}
 	}
 }
 
@@ -833,64 +903,12 @@ render :: proc(editor: ^Editor) {
 	}
 
 	for i := start_line; i < end_line; i += 1 {
-		line := editor.lines[i]
-		if len(line) == 0 {continue}
-
-		current_x := 10.0 - editor.scroll.x
 		y := f32(i) * f32(editor.config.line_height) - editor.scroll.y
-		tab_width_px := f32(editor.config.tab_width) * editor.config.char_width
-
-		// Render line segment by segment
-		seg_builder: strings.Builder
-		strings.builder_init(&seg_builder, context.temp_allocator)
-
-		for r_idx := 0; r_idx < len(line); r_idx += 1 {
-			r := line[r_idx]
-			if r == '\t' {
-				// Flush segment
-				if strings.builder_len(seg_builder) > 0 {
-					text := strings.to_string(seg_builder)
-					c_text := strings.clone_to_cstring(text, context.temp_allocator)
-					text_obj := ttf.CreateText(
-						editor.text_engine,
-						editor.font,
-						c_text,
-						uint(len(text)),
-					)
-					if text_obj != nil {
-						ttf.DrawRendererText(text_obj, current_x, y)
-						// text_obj is opaque, assume monospace width
-						current_x += f32(utf8.rune_count(text)) * editor.config.char_width
-						ttf.DestroyText(text_obj)
-					}
-					strings.builder_reset(&seg_builder)
-				}
-
-				// Advance tab
-				// Rel x from start of line content (ignoring scroll for alignment)
-				line_start_x := 10.0 - editor.scroll.x
-				rel_x := current_x - line_start_x
-				next_tab := (int(rel_x / tab_width_px) + 1)
-				current_x = line_start_x + f32(next_tab) * tab_width_px
-			} else {
-				strings.write_rune(&seg_builder, r)
-			}
-		}
-
-		// Flush remaining
-		if strings.builder_len(seg_builder) > 0 {
-			text := strings.to_string(seg_builder)
-			c_text := strings.clone_to_cstring(text, context.temp_allocator)
-			text_obj := ttf.CreateText(editor.text_engine, editor.font, c_text, uint(len(text)))
-			if text_obj != nil {
-				ttf.DrawRendererText(text_obj, current_x, y)
-				ttf.DestroyText(text_obj)
-			}
-		}
+		render_line(editor, i, y)
 	}
 
 	// Draw Cursor
-	cursor_x: f32 = 10.0 - editor.scroll.x
+	cursor_x: f32 = TEXT_MARGIN - editor.scroll.x
 	if len(editor.lines) > editor.cursor.row {
 		line := editor.lines[editor.cursor.row]
 		width := measure_line_width(line, editor.cursor.col, editor.config)

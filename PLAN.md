@@ -275,3 +275,35 @@ just build  # Manual debug build
 ```
 
 The editor is stored in [src/main.odin](src/main.odin) and uses system fonts for rendering via SDL3_ttf.
+
+## VERSION 0.1.1
+
+This version is a followup cleanup of version 0.1, it aims to make the code clearer, less buggy and more performant. Not a feature
+release, so it won't add any new functionality.
+
+## SESSION 2 SUMMARY: Refactoring & Polish Complete
+
+### Overview
+Executed version 0.1.1 of the plan, focusing on code cleanup, bug fixes, and architecture improvements. The codebase is now more robust and easier to extend.
+
+### Work Completed
+
+#### Code Cleanup & Organization ✓
+- **Refactored Rendering**: Extracted `render_line` procedure to simplify the main `render` loop, reducing complexity in the main update cycle.
+- **Constants**: Introduced `TEXT_MARGIN` (10.0) to replace magic numbers for consistent layout.
+- **Helper Functions**: Created `next_tab_stop` helper to unify tab width calculations across `render`, `measure_line_width`, and `screen_to_grid`, eliminating logic duplication.
+
+#### Bug Fixes & Logic Improvements ✓
+- **Selection Replacement**: Typing text or pressing Enter with an active selection now correctly deletes the selected text before inserting new content (previously it just deselected).
+- **Dirty Flag Tracking**: The `dirty` flag is now correctly set to `true` when inserting text, deleting characters, or modifying lines, ensuring the editor tracks unsaved changes.
+- **Trailing Tab Cleanup**: Moving the cursor horizontally across line boundaries now triggers `leave_line`, ensuring trailing tabs are trimmed correctly on the line being left.
+- **Text Color**: Explicitly set text color to white (220, 220, 220) to ensure visibility against the dark background, rather than relying on defaults.
+
+#### Build Status
+- ✓ Editor compiles without errors: `odin build src -debug` (Exit Code 0)
+
+### Next Steps
+The editor is now in a cleaner state. The original recommendations for the next session remain valid:
+1. **Undo/Redo** - Essential for usable editor (use command pattern or change buffer)
+2. **Search/Replace** - (Ctrl+F, Ctrl+H)
+3. **Line Numbers** - Display column on left side
