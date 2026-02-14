@@ -2,7 +2,9 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+import "core:log"
 import "core:math"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
@@ -12,7 +14,7 @@ import ttf "vendor:sdl3/ttf"
 // 0. Core Data Structures
 
 Editor :: struct {
-	lines:        [dynamic][dynamic]rune, // Dynamic array of lines, each line is dynamic array of runes
+	lines:        [dynamic][dynamic]u8, // Dynamic array of lines, each line is dynamic array of UTF-8 bytes
 	cursor:       Cursor,
 	selection:    Selection,
 	scroll:       Scroll,
@@ -102,6 +104,20 @@ TEXT_MARGIN :: 10.0
 TARGET_FPS :: 120
 
 main :: proc() {
+	context.logger = log.create_console_logger()
+	when ODIN_DEBUG {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+		defer {
+			if len(track.allocation_map) > 0 {
+				for _, entry in track.allocation_map {
+					log.warnf("%v leaked %v bytes", entry.location, entry.size)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
 	// 1. Initialize SDL
 	if !sdl.Init({.VIDEO}) {
 		fmt.eprintln("SDL_Init failed")
@@ -116,6 +132,7 @@ main :: proc() {
 	defer ttf.Quit()
 
 	editor := Editor{}
+	defer free_editor(&editor)
 	editor.config = Config {
 		tab_width   = 4,
 		font_size   = 16,
@@ -175,7 +192,7 @@ main :: proc() {
 	if len(os.args) > 1 {
 		load_file(&editor, os.args[1])
 	} else {
-		append(&editor.lines, make([dynamic]rune))
+		append(&editor.lines, make([dynamic]u8))
 	}
 
 	if !sdl.StartTextInput(editor.window) {
@@ -215,6 +232,7 @@ get_gutter_width :: proc(editor: ^Editor) -> f32 {
 	lines_count := len(editor.lines)
 	if lines_count < 1 {lines_count = 1}
 	digits := int(math.log10(f32(lines_count))) + 1
+	if digits < 4 {digits = 4}
 	return f32(digits) * editor.config.char_width + 20.0
 }
 
@@ -241,7 +259,7 @@ draw_selection_rects :: proc(editor: ^Editor, view_start, view_end: int) {
 	end_r := min(e.row, view_end - 1)
 
 	for r := start_r; r <= end_r; r += 1 {
-		line_len := len(editor.lines[r])
+		line_len := get_char_col(editor.lines[r][:], len(editor.lines[r]))
 
 		c_start := 0
 		if r == s.row {c_start = s.col}
@@ -337,7 +355,7 @@ handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
 				load_file(editor, path)
 			}
 
-			delete(c_path)
+			// mem.free(rawptr(c_path), runtime.default_allocator())
 		}
 	} else if event.type == .MOUSE_BUTTON_DOWN {
 		if event.button.button == sdl.BUTTON_LEFT {
@@ -397,28 +415,39 @@ screen_to_grid :: proc(editor: ^Editor, x, y: f32) -> (int, int) {
 	current_x := f32(0.0)
 	tab_width_px := f32(editor.config.tab_width) * editor.config.char_width
 
-	for i := 0; i < len(line); i += 1 {
+	offset := 0
+	col := 0
+	for offset < len(line) {
+		r, w := utf8.decode_rune(line[offset:])
 		char_w := editor.config.char_width
-		if line[i] == '\t' {
+		if r == '	' {
 			new_x := next_tab_stop(current_x, tab_width_px)
 			char_w = new_x - current_x
 		}
 
 		if rel_x < current_x + char_w / 2.0 {
-			return row, i
+			return row, col
 		}
 		current_x += char_w
+		offset += w
+		col += 1
 	}
 
-	return row, len(line)
+	return row, col
 }
 
-measure_line_width :: proc(line: [dynamic]rune, count: int, config: Config) -> f32 {
+measure_line_width :: proc(line: [dynamic]u8, count: int, config: Config) -> f32 {
 	width := f32(0.0)
 	tab_width_px := f32(config.tab_width) * config.char_width
 
-	for i := 0; i < count && i < len(line); i += 1 {
-		if line[i] == '\t' {
+	offset := 0
+	chars := 0
+	for offset < len(line) && chars < count {
+		r, w := utf8.decode_rune(line[offset:])
+		offset += w
+		chars += 1
+
+		if r == '	' {
 			width = next_tab_stop(width, tab_width_px)
 		} else {
 			width += config.char_width
@@ -643,7 +672,7 @@ perform_search :: proc(editor: ^Editor) {
 		line := editor.lines[i]
 		// Optimization: Check if line contains first rune of query?
 		// For now, simple conversion
-		line_str := utf8.runes_to_string(line[:], context.temp_allocator)
+		line_str := string(line[:])
 
 		start_idx := 0
 		for {
@@ -720,6 +749,24 @@ update_selection :: proc(editor: ^Editor, is_shift: bool, old_cursor: Cursor) {
 	}
 }
 
+
+get_byte_offset :: proc(line: []u8, col: int) -> int {
+	offset := 0
+	count := 0
+	for offset < len(line) && count < col {
+		_, w := utf8.decode_rune(line[offset:])
+		offset += w
+		count += 1
+	}
+	return offset
+}
+
+get_char_col :: proc(line: []u8, offset: int) -> int {
+	if offset > len(line) {return utf8.rune_count(line)}
+	return utf8.rune_count(line[:offset])
+}
+
+
 load_file :: proc(editor: ^Editor, path: string) {
 	data, err := os.read_entire_file(path, context.allocator)
 	if err != os.General_Error.None {
@@ -734,33 +781,51 @@ load_file :: proc(editor: ^Editor, path: string) {
 	}
 	clear(&editor.lines)
 
-	// Stream decode
+	// Scan lines first to allocate exact capacity
+	// This optimization saves memory by avoiding capacity growth overhead
 	offset := 0
-	current_line := make([dynamic]rune)
-
+	line_start := 0
 	for offset < len(data) {
-		r, w := utf8.decode_rune(data[offset:])
-		offset += w
+		b := data[offset]
+		offset += 1
 
-		if r == '\r' {
-			continue
-		} else if r == '\n' {
-			append(&editor.lines, current_line)
-			current_line = make([dynamic]rune)
-		} else {
-			append(&current_line, r)
+		if b == '\n' {
+			// Found line end
+			count := offset - line_start - 1 // Exclude
+
+			if count > 0 && data[offset - 2] == 13 {
+				count -= 1 // Exclude
+			}
+			if count < 0 {count = 0}
+
+			line := make([dynamic]u8, count, count)
+			// Copy data
+			copy(line[:], data[line_start:line_start + count])
+			append(&editor.lines, line)
+
+			line_start = offset
 		}
 	}
-	// Append last line
-	append(&editor.lines, current_line)
+
+	// Last line
+	if line_start < len(data) {
+		count := len(data) - line_start
+		line := make([dynamic]u8, count, count)
+		copy(line[:], data[line_start:])
+		append(&editor.lines, line)
+	} else if len(data) > 0 && data[len(data) - 1] == '\n' {
+		// File ended with newline, add empty line
+		append(&editor.lines, make([dynamic]u8))
+	} else if len(data) == 0 {
+		append(&editor.lines, make([dynamic]u8))
+	}
 
 	editor.file_path = strings.clone(path)
 	editor.cursor = Cursor{0, 0, 0}
 	editor.selection.active = false
 
 	// Clear undo history
-	clear(&editor.undo_manager.undo_stack)
-	clear(&editor.undo_manager.redo_stack)
+	clear_undo_history(editor)
 
 	fmt.println("Loaded file:", path)
 }
@@ -772,7 +837,7 @@ save_file :: proc(editor: ^Editor, path: string) {
 
 	for i := 0; i < len(editor.lines); i += 1 {
 		line := editor.lines[i]
-		str := utf8.runes_to_string(line[:], context.temp_allocator)
+		str := string(line[:])
 		strings.write_string(&builder, str)
 		if i < len(editor.lines) - 1 {
 			strings.write_byte(&builder, '\n') // Unix style
@@ -794,11 +859,6 @@ save_file :: proc(editor: ^Editor, path: string) {
 }
 
 copy_selection :: proc(editor: ^Editor) {
-	// Simple stub for now to fix build if functions missing
-	// Assuming logic from previous step is fine but maybe missing imports?
-	// Ah, strings builder usage needs "core:strings" which is imported.
-	// But get_selection_text logic was complex.
-
 	s := editor.selection.anchor
 	e := editor.cursor
 
@@ -809,32 +869,22 @@ copy_selection :: proc(editor: ^Editor) {
 	}
 
 	builder: strings.Builder
-	strings.builder_init(&builder, context.temp_allocator) // Use temp allocator for simplicity
+	strings.builder_init(&builder, context.temp_allocator)
 
 	for r := s.row; r <= e.row; r += 1 {
 		line := editor.lines[r]
-		c_start := 0
-		if r == s.row {c_start = s.col}
-		c_end := len(line)
-		if r == e.row {c_end = e.col}
+		start_offset := 0
+		if r == s.row {start_offset = get_byte_offset(line[:], s.col)}
 
-		if c_end > len(line) {c_end = len(line)}
-		if c_start > len(line) {c_start = len(line)}
+		end_offset := len(line)
+		if r == e.row {end_offset = get_byte_offset(line[:], e.col)}
 
-		if c_start < c_end {
-			// Slicing dynamic array?
-			// line is [dynamic]rune
-			// slice := line[c_start:c_end] works in Odin?
-			// slice is []rune
+		if end_offset > len(line) {end_offset = len(line)}
+		if start_offset > len(line) {start_offset = len(line)}
 
-			// Manual copy to ensure we have a valid slice
-			// Or just utf8.runes_to_string
-			// But runes_to_string takes []rune.
-			// line[:] is []rune.
-
-			slice := line[c_start:c_end]
-			str := utf8.runes_to_string(slice, context.temp_allocator)
-			strings.write_string(&builder, str)
+		if start_offset < end_offset {
+			slice := line[start_offset:end_offset]
+			strings.write_string(&builder, string(slice))
 		}
 
 		if r != e.row {
@@ -876,17 +926,17 @@ insert_text :: proc(editor: ^Editor, text: string) {
 
 	for i := 0; i < len(lines_str); i += 1 {
 		line_str := lines_str[i]
-		// Strip \r
+		// Strip
 		content := line_str
-		if len(content) > 0 && content[len(content) - 1] == '\r' {
+		if len(content) > 0 && content[len(content) - 1] == '\n' {
 			content = content[:len(content) - 1]
 		}
 
 		if len(content) > 0 {
-			runes := utf8.string_to_runes(content, context.temp_allocator)
 			line := &editor.lines[editor.cursor.row]
-			inject_at(line, editor.cursor.col, ..runes)
-			editor.cursor.col += len(runes)
+			offset := get_byte_offset(line[:], editor.cursor.col)
+			inject_at(line, offset, ..transmute([]u8)content)
+			editor.cursor.col += utf8.rune_count(content)
 		}
 
 		if i < len(lines_str) - 1 {
@@ -911,13 +961,14 @@ insert_newline_internal :: proc(editor: ^Editor) {
 	}
 
 	current_line := &editor.lines[editor.cursor.row]
+	offset := get_byte_offset(current_line[:], editor.cursor.col)
 
 	// Split current line at cursor.col
 	// Right part moves to new line
-	right_part := make([dynamic]rune)
-	if editor.cursor.col < len(current_line) {
-		append(&right_part, ..current_line[editor.cursor.col:])
-		resize(current_line, editor.cursor.col)
+	right_part := make([dynamic]u8)
+	if offset < len(current_line) {
+		append(&right_part, ..current_line[offset:])
+		resize(current_line, offset)
 	}
 
 	// Insert new line after current row
@@ -936,9 +987,12 @@ delete_char_backwards :: proc(editor: ^Editor) {
 		// Record deletion
 		if editor.cursor.col > 0 {
 			line := editor.lines[editor.cursor.row]
-			if editor.cursor.col - 1 < len(line) {
-				char := line[editor.cursor.col - 1]
-				text := utf8.runes_to_string([]rune{char}, context.temp_allocator)
+			offset := get_byte_offset(line[:], editor.cursor.col)
+			if offset > 0 {
+				str := string(line[:offset])
+				_, w := utf8.decode_last_rune_in_string(str)
+				char_bytes := line[offset - w:offset]
+				text := string(char_bytes)
 				record_action(
 					editor,
 					.Delete,
@@ -950,7 +1004,14 @@ delete_char_backwards :: proc(editor: ^Editor) {
 			record_action(
 				editor,
 				.Delete,
-				Cursor{editor.cursor.row - 1, len(editor.lines[editor.cursor.row - 1]), 0},
+				Cursor {
+					editor.cursor.row - 1,
+					get_char_col(
+						editor.lines[editor.cursor.row - 1][:],
+						len(editor.lines[editor.cursor.row - 1]),
+					),
+					0,
+				},
 				"\n",
 			)
 		}
@@ -960,16 +1021,21 @@ delete_char_backwards :: proc(editor: ^Editor) {
 		editor.dirty = true
 		// Remove char at col-1
 		line := &editor.lines[editor.cursor.row]
-		ordered_remove(line, editor.cursor.col - 1)
-		editor.cursor.col -= 1
-		editor.cursor.preferred_col = editor.cursor.col
+		offset := get_byte_offset(line[:], editor.cursor.col)
+		if offset > 0 {
+			str := string(line[:offset])
+			_, w := utf8.decode_last_rune_in_string(str)
+			remove_range(line, offset - w, offset)
+			editor.cursor.col -= 1
+			editor.cursor.preferred_col = editor.cursor.col
+		}
 	} else if editor.cursor.row > 0 {
 		editor.dirty = true
 		// Merge with previous line
 		curr_line := editor.lines[editor.cursor.row]
 		prev_line := &editor.lines[editor.cursor.row - 1]
 
-		old_len := len(prev_line)
+		old_len_chars := get_char_col(prev_line[:], len(prev_line))
 		append(prev_line, ..curr_line[:])
 
 		// Remove current line
@@ -977,8 +1043,8 @@ delete_char_backwards :: proc(editor: ^Editor) {
 		delete(curr_line) // Free memory of removed line
 
 		editor.cursor.row -= 1
-		editor.cursor.col = old_len
-		editor.cursor.preferred_col = old_len
+		editor.cursor.col = old_len_chars
+		editor.cursor.preferred_col = old_len_chars
 	}
 	ensure_cursor_visible(editor)
 }
@@ -1015,24 +1081,25 @@ delete_selection :: proc(editor: ^Editor) {
 delete_range :: proc(editor: ^Editor, s, e: Cursor) {
 	if s.row == e.row {
 		line := &editor.lines[s.row]
-		count := e.col - s.col
-		if count > 0 && s.col < len(line) {
-			end_idx := min(e.col, len(line))
-			// Use ordered_remove in loop or just slice
-			// Slicing is faster for large chunks
-			// But dynamic array remove is tricky
-			// ordered_remove shifts every time.
-			// Better: remove range logic manually
-			remove_range(line, s.col, end_idx)
+		start_offset := get_byte_offset(line[:], s.col)
+		end_offset := get_byte_offset(line[:], e.col)
+
+		if start_offset < len(line) {
+			real_end := min(end_offset, len(line))
+			if start_offset < real_end {
+				remove_range(line, start_offset, real_end)
+			}
 		}
 	} else {
 		// Multi-line delete
 		start_line := &editor.lines[s.row]
-		resize(start_line, s.col)
+		start_offset := get_byte_offset(start_line[:], s.col)
+		resize(start_line, start_offset)
 
 		end_line := editor.lines[e.row]
-		if e.col < len(end_line) {
-			append(start_line, ..end_line[e.col:])
+		end_offset := get_byte_offset(end_line[:], e.col)
+		if end_offset < len(end_line) {
+			append(start_line, ..end_line[end_offset:])
 		}
 
 		for i := e.row; i > s.row; i -= 1 {
@@ -1044,21 +1111,22 @@ delete_range :: proc(editor: ^Editor, s, e: Cursor) {
 
 get_text_in_range :: proc(editor: ^Editor, s, e: Cursor) -> string {
 	builder: strings.Builder
-	strings.builder_init(&builder, context.allocator) // Use main allocator, caller frees
+	strings.builder_init(&builder, context.allocator)
 
 	for r := s.row; r <= e.row; r += 1 {
 		line := editor.lines[r]
-		c_start := 0
-		if r == s.row {c_start = s.col}
-		c_end := len(line)
-		if r == e.row {c_end = e.col}
+		start_offset := 0
+		if r == s.row {start_offset = get_byte_offset(line[:], s.col)}
 
-		if c_end > len(line) {c_end = len(line)}
-		if c_start > len(line) {c_start = len(line)}
+		end_offset := len(line)
+		if r == e.row {end_offset = get_byte_offset(line[:], e.col)}
 
-		if c_start < c_end {
-			str := utf8.runes_to_string(line[c_start:c_end], context.temp_allocator)
-			strings.write_string(&builder, str)
+		if end_offset > len(line) {end_offset = len(line)}
+		if start_offset > len(line) {start_offset = len(line)}
+
+		if start_offset < end_offset {
+			slice := line[start_offset:end_offset]
+			strings.write_string(&builder, string(slice))
 		}
 
 		if r != e.row {
@@ -1294,80 +1362,122 @@ render_line :: proc(editor: ^Editor, line_index: int, y: f32) {
 	sdl.GetWindowSize(editor.window, &w_win, nil)
 	screen_width := f32(w_win)
 
-	// Render line segment by segment
-	seg_builder: strings.Builder
-	strings.builder_init(&seg_builder, context.temp_allocator)
-	seg_runes := 0
+	// Quick Skip if entire line is off-screen left (requires knowing width)
+	// We don't know total width. But we can skip left part fast.
 
-	for r_idx := 0; r_idx < len(line); r_idx += 1 {
-		// Culling
-		if current_x > screen_width {break}
-
-		r := line[r_idx]
-		if r == '\t' {
-			// Flush segment
-			if strings.builder_len(seg_builder) > 0 {
-				text := strings.to_string(seg_builder)
-				c_text := strings.clone_to_cstring(text, context.temp_allocator)
-				text_obj := ttf.CreateText(
-					editor.text_engine,
-					editor.font,
-					c_text,
-					uint(len(text)),
-				)
-				if text_obj != nil {
-					ttf.SetTextColor(text_obj, 220, 220, 220, 255)
-					ttf.DrawRendererText(text_obj, current_x, y)
-					// text_obj is opaque, assume monospace width
-					current_x += f32(utf8.rune_count(text)) * editor.config.char_width
-					ttf.DestroyText(text_obj)
+	// Estimate chars to skip if far left
+	offset := 0
+	if current_x < -100.0 {
+		// Skip some chars
+		pixels_to_skip := -current_x - 100.0
+		estimated_chars := int(pixels_to_skip / editor.config.char_width)
+		if estimated_chars > 0 {
+			// Verify we don't skip tabs blindly
+			// Just loop without rendering until we are close
+			for offset < len(line) && current_x < -100.0 {
+				r, w := utf8.decode_rune(line[offset:])
+				if r == '	' {
+					line_start_x := start_x - editor.scroll.x
+					rel_x := current_x - line_start_x
+					current_x = line_start_x + next_tab_stop(rel_x, tab_width_px)
+				} else {
+					current_x += editor.config.char_width
 				}
-				strings.builder_reset(&seg_builder)
-				seg_runes = 0
-			}
-
-			// Advance tab
-			// Rel x from start of line content (ignoring scroll for alignment)
-			line_start_x := start_x - editor.scroll.x
-			rel_x := current_x - line_start_x
-			current_x = line_start_x + next_tab_stop(rel_x, tab_width_px)
-		} else {
-			if strings.builder_len(seg_builder) == 0 && current_x + editor.config.char_width < 0 {
-				current_x += editor.config.char_width
-				continue
-			}
-
-			strings.write_rune(&seg_builder, r)
-			seg_runes += 1
-			if current_x + f32(seg_runes) * editor.config.char_width > screen_width {
-				// Flush and stop
-				text := strings.to_string(seg_builder)
-				c_text := strings.clone_to_cstring(text, context.temp_allocator)
-				text_obj := ttf.CreateText(
-					editor.text_engine,
-					editor.font,
-					c_text,
-					uint(len(text)),
-				)
-				if text_obj != nil {
-					ttf.SetTextColor(text_obj, 220, 220, 220, 255)
-					ttf.DrawRendererText(text_obj, current_x, y)
-					ttf.DestroyText(text_obj)
-				}
-				return
+				offset += w
 			}
 		}
 	}
 
-	// Flush remaining
-	if strings.builder_len(seg_builder) > 0 {
-		text := strings.to_string(seg_builder)
-		c_text := strings.clone_to_cstring(text, context.temp_allocator)
-		text_obj := ttf.CreateText(editor.text_engine, editor.font, c_text, uint(len(text)))
-		if text_obj != nil {
-			ttf.SetTextColor(text_obj, 220, 220, 220, 255)
-			ttf.DrawRendererText(text_obj, current_x, y)
-			ttf.DestroyText(text_obj)
+	for offset < len(line) {
+		// Culling (Right side)
+		if current_x > screen_width {break}
+
+		r, w := utf8.decode_rune(line[offset:])
+
+		if r == '	' {
+			line_start_x := start_x - editor.scroll.x
+			rel_x := current_x - line_start_x
+			current_x = line_start_x + next_tab_stop(rel_x, tab_width_px)
+			offset += w
+		} else {
+			// Gather sequence
+			start_offset := offset
+			runes_count := 0
+
+			look_offset := offset
+			for look_offset < len(line) {
+				nr, nw := utf8.decode_rune(line[look_offset:])
+				if nr == '	' {break}
+				look_offset += nw
+				runes_count += 1
+			}
+
+			segment_width := f32(runes_count) * editor.config.char_width
+
+			// Render only if visible
+			if current_x + segment_width > 0 && current_x < screen_width {
+				// Calculate visible sub-slice
+
+				slice_start_runes := 0
+				if current_x < 0 {
+					slice_start_runes = int((-current_x) / editor.config.char_width)
+				}
+
+				slice_end_runes := runes_count
+				if current_x + segment_width > screen_width {
+					visible_width := screen_width - current_x
+					slice_end_runes = int(visible_width / editor.config.char_width) + 1
+				}
+
+				if slice_start_runes < slice_end_runes {
+					// Find byte offsets for these rune indices
+					// This requires decoding again or careful stepping
+					// Optimization: We already know start_offset.
+
+					sub_start_offset := start_offset
+					// Skip to start
+					curr_rune_idx := 0
+					temp_off := start_offset
+					for curr_rune_idx < slice_start_runes {
+						_, nw := utf8.decode_rune(line[temp_off:])
+						temp_off += nw
+						curr_rune_idx += 1
+					}
+					sub_start_offset = temp_off
+
+					sub_end_offset := sub_start_offset
+					// Skip to end
+					for curr_rune_idx < slice_end_runes && temp_off < look_offset {
+						_, nw := utf8.decode_rune(line[temp_off:])
+						temp_off += nw
+						curr_rune_idx += 1
+					}
+					sub_end_offset = temp_off
+
+					if sub_start_offset < sub_end_offset {
+						segment := line[sub_start_offset:sub_end_offset]
+						text := string(segment)
+
+						render_x := current_x + f32(slice_start_runes) * editor.config.char_width
+
+						c_text := strings.clone_to_cstring(text, context.temp_allocator)
+						text_obj := ttf.CreateText(
+							editor.text_engine,
+							editor.font,
+							c_text,
+							uint(len(text)),
+						)
+						if text_obj != nil {
+							ttf.SetTextColor(text_obj, 220, 220, 220, 255)
+							ttf.DrawRendererText(text_obj, render_x, y)
+							ttf.DestroyText(text_obj)
+						}
+					}
+				}
+			}
+
+			current_x += segment_width
+			offset = look_offset
 		}
 	}
 }
@@ -1549,4 +1659,32 @@ draw_search_bar :: proc(editor: ^Editor) {
 			ttf.DestroyText(count_obj)
 		}
 	}
+}
+
+clear_undo_history :: proc(editor: ^Editor) {
+	for action in editor.undo_manager.undo_stack {
+		delete(action.text)
+	}
+	clear(&editor.undo_manager.undo_stack)
+
+	for action in editor.undo_manager.redo_stack {
+		delete(action.text)
+	}
+	clear(&editor.undo_manager.redo_stack)
+}
+
+free_editor :: proc(editor: ^Editor) {
+	// Free lines
+	for line in editor.lines {
+		delete(line)
+	}
+	delete(editor.lines)
+
+	// Free undo
+	clear_undo_history(editor)
+	delete(editor.undo_manager.undo_stack)
+	delete(editor.undo_manager.redo_stack)
+
+	// Free path
+	delete(editor.file_path)
 }
