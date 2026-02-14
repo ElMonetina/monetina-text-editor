@@ -1,0 +1,9 @@
+*
+!.gitignore
+!src/
+!src/**
+!fonts/
+!fonts/**
+!justfile
+!PLAN.md
+!README.md
