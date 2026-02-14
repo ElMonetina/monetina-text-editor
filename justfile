@@ -7,5 +7,5 @@ run:
 build:
     odin build src -debug
 
-just release:
+release:
     odin build src -o=speed
