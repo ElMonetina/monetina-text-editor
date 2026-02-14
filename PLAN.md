@@ -307,3 +307,125 @@ The editor is now in a cleaner state. The original recommendations for the next 
 1. **Undo/Redo** - Essential for usable editor (use command pattern or change buffer)
 2. **Search/Replace** - (Ctrl+F, Ctrl+H)
 3. **Line Numbers** - Display column on left side
+
+## VERSION 0.2
+
+This version focuses on essential text editing features and usability improvements.
+
+### Features
+1.  **Undo/Redo System**: Robust history of actions.
+2.  **Search & Replace**: Find text within the file and replace occurrences.
+3.  **Line Numbers**: Visual indicator of line positions.
+4.  **Performance**: Optimize file loading for larger files.
+
+### Implementation Details
+
+#### 1. Undo/Redo System
+**Architecture**: Command Pattern with History Stacks.
+
+```odin
+ActionType :: enum { Insert, Delete }
+
+Action :: struct {
+    type: ActionType,
+    start: Cursor,       // Where the action happened
+    text: string,        // The text involved (inserted or deleted)
+    timestamp: u64,      // For grouping typing actions
+}
+
+UndoManager :: struct {
+    undo_stack: [dynamic]Action,
+    redo_stack: [dynamic]Action,
+    is_undoing: bool,    // Flag to prevent recording actions during undo/redo
+}
+```
+
+**Logic**:
+- **Record Action**: Whenever `insert_text` or `delete_...` is called, push an `Action` to `undo_stack` and clear `redo_stack`.
+- **Undo (Ctrl+Z)**: Pop from `undo_stack`.
+    - If `Insert`: Delete inserted text (range `start` to `start + len`).
+    - If `Delete`: Insert `text` at `start`.
+    - Push inverse action to `redo_stack`.
+- **Redo (Ctrl+Y)**: Pop from `redo_stack`, execute, push to `undo_stack`.
+- **Grouping**: Consecutive character insertions within a small time window should be merged into a single action to avoid undoing one character at a time.
+
+#### 2. Search & Replace
+**UI**:
+- A simple overlay at the bottom of the screen.
+- Toggle with `Ctrl+F`.
+- Input field for search query.
+
+**State**:
+```odin
+SearchState :: struct {
+    active: bool,
+    query: strings.Builder,
+    results: [dynamic]Cursor, // Start positions of matches
+    current_idx: int,
+}
+```
+
+**Logic**:
+- **Find**: Scan `editor.lines`, match `query`. Store results.
+- **Navigate (Enter/F3)**: Move cursor to `results[current_idx]`, scroll to view.
+- **Highlight**: Draw a different background color for the text at result positions.
+
+#### 3. Line Numbers
+**Rendering**:
+- Calculate `gutter_width` based on `total_lines` digits.
+- In `render()`:
+    - Draw a background rect for the gutter on the left.
+    - Loop visible lines: Render line number at `y`, right-aligned in gutter.
+    - Offset text rendering X start position by `gutter_width`.
+- **Input**: Adjust `screen_to_grid` to account for `gutter_width` offset (subtract it from mouse X).
+
+#### 4. Performance: File Loading
+**Current**: `read_entire_file` -> `split` -> `string_to_runes` (High memory usage/allocations).
+**Optimized**:
+- Read file bytes.
+- Iterate bytes, decoding UTF-8 on the fly using `utf8.decode_rune`.
+- Build `[dynamic]rune` for current line.
+- On `\n`, append line to `lines`, start new line.
+- Avoid creating intermediate strings for every line.
+
+### Plan Steps
+1.  **Refactor**: Implement `UndoManager` and hook it into `insert`/`delete`.
+2.  **Feature**: Implement `Ctrl+Z` / `Ctrl+Y`.
+3.  **UI**: Implement Line Numbers (affects layout constants).
+4.  **UI**: Implement Search overlay and logic.
+5.  **Optimization**: Rewrite `load_file`.
+
+## SESSION 3 SUMMARY: Version 0.2 Complete
+
+### Overview
+Successfully implemented all planned features for Version 0.2, including robust Undo/Redo, Search & Replace, Line Numbers, and significant performance optimizations. The editor now supports advanced editing workflows and handles large files smoothly.
+
+### Work Completed
+
+#### 1. Undo/Redo System ✓
+- **Architecture**: Implemented Command Pattern with `UndoManager` and `Action` structs.
+- **Actions**: Supports `Insert` and `Delete` actions with precise cursor restoration.
+- **Integration**: Hooked into all text modification functions (`insert_text`, `delete_selection`, etc.).
+- **Shortcuts**: `Ctrl+Z` (Undo), `Ctrl+Y` / `Ctrl+Shift+Z` (Redo).
+
+#### 2. Search & Replace ✓
+- **UI**: Added a custom overlay at the bottom of the window.
+- **Find**: Real-time search with result highlighting (yellow blend mode).
+- **Replace**: `Ctrl+H` toggles Replace mode. `Enter` replaces current match and finds next.
+- **Navigation**: `Enter`, `F3`, `Shift+F3` for cycling through results.
+- **Feedback**: Displays match count (e.g., "1/5") and highlights current match.
+
+#### 3. Line Numbers & Gutter ✓
+- **Dynamic Width**: Gutter width scales based on total line count (`log10`).
+- **Rendering**: Drawn on top of text content to handle horizontal scrolling correctly.
+- **Interaction**: Clicking the gutter selects the corresponding line.
+- **Visuals**: Distinct background color and right-aligned numbers.
+
+#### 4. Performance Optimizations ✓
+- **File Loading**: Rewrote `load_file` to stream UTF-8 bytes directly into dynamic rune arrays, avoiding massive string allocations.
+- **Rendering**: Implemented view frustum culling in `render_line` to skip processing/rendering characters outside the visible viewport (both left and right).
+- **Smooth Scrolling**: Clamped `dt` to prevent scroll jumping during lag spikes.
+- **Frame Rate**: Added a 120 FPS limiter and disabled VSync to ensure consistent performance.
+
+### Build Status
+- ✓ Editor compiles and runs successfully: `odin build src -debug`

@@ -12,20 +12,23 @@ import ttf "vendor:sdl3/ttf"
 // 0. Core Data Structures
 
 Editor :: struct {
-	lines:       [dynamic][dynamic]rune, // Dynamic array of lines, each line is dynamic array of runes
-	cursor:      Cursor,
-	selection:   Selection,
-	scroll:      Scroll,
-	config:      Config,
-	file_path:   string,
-	dirty:       bool, // Has unsaved changes?
+	lines:        [dynamic][dynamic]rune, // Dynamic array of lines, each line is dynamic array of runes
+	cursor:       Cursor,
+	selection:    Selection,
+	scroll:       Scroll,
+	config:       Config,
+	undo_manager: UndoManager,
+	search:       SearchState,
+	file_path:    string,
+	dirty:        bool, // Has unsaved changes?
 
 	// Rendering state
-	window:      ^sdl.Window,
-	renderer:    ^sdl.Renderer,
-	font:        ^ttf.Font,
-	text_engine: ^ttf.TextEngine,
-	last_tick:   u64, // Time of last frame
+	window:       ^sdl.Window,
+	renderer:     ^sdl.Renderer,
+	font:         ^ttf.Font,
+	text_engine:  ^ttf.TextEngine,
+	last_tick:    u64, // Time of last frame
+	window_focus: bool,
 }
 
 Cursor :: struct {
@@ -53,11 +56,50 @@ Config :: struct {
 	char_width:  f32,
 }
 
+ActionType :: enum {
+	Insert,
+	Delete,
+}
+
+Action :: struct {
+	type:      ActionType,
+	start:     Cursor,
+	text:      string,
+	timestamp: u64,
+}
+
+UndoManager :: struct {
+	undo_stack: [dynamic]Action,
+	redo_stack: [dynamic]Action,
+	is_undoing: bool,
+}
+
+SearchState :: struct {
+	active:        bool,
+	mode:          SearchMode,
+	query:         strings.Builder,
+	replace_query: strings.Builder,
+	results:       [dynamic]Cursor,
+	current_idx:   int,
+	focus:         SearchFocus,
+}
+
+SearchMode :: enum {
+	Find,
+	Replace,
+}
+
+SearchFocus :: enum {
+	Query,
+	ReplaceQuery,
+}
+
 // Global constants
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 600
 FONT_PATH :: "fonts/Fira_Mono/FiraMono-Regular.ttf"
 TEXT_MARGIN :: 10.0
+TARGET_FPS :: 120
 
 main :: proc() {
 	// 1. Initialize SDL
@@ -81,6 +123,12 @@ main :: proc() {
 		char_width  = 10.0, // Will be updated
 	}
 
+	strings.builder_init(&editor.search.query)
+	strings.builder_init(&editor.search.replace_query)
+	defer strings.builder_destroy(&editor.search.query)
+	defer strings.builder_destroy(&editor.search.replace_query)
+	defer delete(editor.search.results)
+
 	// Initialize Window and Renderer
 	window_flags := sdl.WindowFlags{.RESIZABLE, .HIGH_PIXEL_DENSITY}
 	w_name := cstring("monetina-text-editor")
@@ -97,6 +145,8 @@ main :: proc() {
 		return
 	}
 	defer sdl.DestroyRenderer(editor.renderer)
+
+	sdl.SetRenderVSync(editor.renderer, 0)
 
 	editor.text_engine = ttf.CreateRendererTextEngine(editor.renderer)
 	if editor.text_engine == nil {
@@ -139,6 +189,8 @@ main :: proc() {
 	// Main Loop
 	running := true
 	for running {
+		frame_start := sdl.GetTicks()
+
 		event: sdl.Event
 		for sdl.PollEvent(&event) {
 			if event.type == .QUIT {
@@ -151,7 +203,23 @@ main :: proc() {
 		render(&editor)
 
 		free_all(context.temp_allocator)
+
+		frame_time := sdl.GetTicks() - frame_start
+		if frame_time < 1000 / TARGET_FPS {
+			sdl.Delay(u32(1000 / TARGET_FPS - frame_time))
+		}
 	}
+}
+
+get_gutter_width :: proc(editor: ^Editor) -> f32 {
+	lines_count := len(editor.lines)
+	if lines_count < 1 {lines_count = 1}
+	digits := int(math.log10(f32(lines_count))) + 1
+	return f32(digits) * editor.config.char_width + 20.0
+}
+
+get_text_start_x :: proc(editor: ^Editor) -> f32 {
+	return get_gutter_width(editor) + TEXT_MARGIN
 }
 
 draw_selection_rects :: proc(editor: ^Editor, view_start, view_end: int) {
@@ -190,7 +258,8 @@ draw_selection_rects :: proc(editor: ^Editor, view_start, view_end: int) {
 		x_start := measure_line_width(editor.lines[r], c_start, editor.config)
 		x_end := measure_line_width(editor.lines[r], c_end, editor.config)
 
-		x := TEXT_MARGIN - editor.scroll.x + x_start
+		offset_x := get_text_start_x(editor)
+		x := offset_x - editor.scroll.x + x_start
 		width := (x_end - x_start) + extra_width
 
 		y := f32(r) * f32(editor.config.line_height) - editor.scroll.y
@@ -237,6 +306,13 @@ open_file_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: 
 }
 
 handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
+	if editor.search.active {
+		if event.type == .TEXT_INPUT || event.type == .KEY_DOWN {
+			handle_search_input(editor, event)
+			return
+		}
+	}
+
 	if event.type == .TEXT_INPUT {
 		// Handle text input
 		text_str := string(event.text.text)
@@ -315,7 +391,7 @@ screen_to_grid :: proc(editor: ^Editor, x, y: f32) -> (int, int) {
 	if row < 0 {row = 0}
 	if row >= len(editor.lines) {row = len(editor.lines) - 1}
 
-	rel_x := x + editor.scroll.x - TEXT_MARGIN
+	rel_x := x + editor.scroll.x - get_text_start_x(editor)
 
 	line := editor.lines[row]
 	current_x := f32(0.0)
@@ -418,10 +494,219 @@ handle_key :: proc(editor: ^Editor, key: sdl.KeyboardEvent) {
 					save_file(editor, editor.file_path)
 				}
 			}
+		case sdl.K_Z:
+			if is_ctrl {
+				if is_shift {
+					redo(editor)
+				} else {
+					undo(editor)
+				}
+			}
+		case sdl.K_Y:
+			if is_ctrl {
+				redo(editor)
+			}
+		case sdl.K_F:
+			if is_ctrl {
+				editor.search.active = true
+				editor.search.mode = .Find
+				editor.search.focus = .Query
+				perform_search(editor)
+			}
+		case sdl.K_H:
+			if is_ctrl {
+				editor.search.active = true
+				editor.search.mode = .Replace
+				editor.search.focus = .Query
+				perform_search(editor)
+			}
 		case:
 		// Handle other keys
 		}
 	}
+}
+
+handle_search_input :: proc(editor: ^Editor, event: ^sdl.Event) {
+	if event.type == .KEY_DOWN {
+		key := event.key.key
+		switch key {
+		case sdl.K_ESCAPE:
+			editor.search.active = false
+			editor.window_focus = true // Restore focus
+		case sdl.K_BACKSPACE:
+			builder := &editor.search.query
+			if editor.search.focus == .ReplaceQuery {
+				builder = &editor.search.replace_query
+			}
+			if strings.builder_len(builder^) > 0 {
+				// Remove last rune
+				str := strings.to_string(builder^)
+				_, w := utf8.decode_last_rune(str)
+				// Rebuild without last char
+				// Efficient enough for search query
+				new_str := str[:len(str) - w]
+				clone := strings.clone(new_str, context.temp_allocator)
+				strings.builder_reset(builder)
+				strings.write_string(builder, clone)
+			}
+			if editor.search.focus == .Query {
+				perform_search(editor)
+			}
+		case sdl.K_TAB:
+			if editor.search.mode == .Replace {
+				if editor.search.focus == .Query {
+					editor.search.focus = .ReplaceQuery
+				} else {
+					editor.search.focus = .Query
+				}
+			}
+		case sdl.K_RETURN:
+			if editor.search.mode == .Replace && editor.search.focus == .ReplaceQuery {
+				perform_replace(editor)
+			} else {
+				jump_to_next_result(editor)
+			}
+		case sdl.K_F3:
+			mods := sdl.GetModState()
+			if (mods & sdl.KMOD_SHIFT) != nil {
+				// Prev
+				jump_to_prev_result(editor)
+			} else {
+				jump_to_next_result(editor)
+			}
+		}
+	} else if event.type == .TEXT_INPUT {
+		text := string(event.text.text)
+		if editor.search.focus == .Query {
+			strings.write_string(&editor.search.query, text)
+			perform_search(editor)
+		} else {
+			strings.write_string(&editor.search.replace_query, text)
+		}
+	}
+}
+
+perform_replace :: proc(editor: ^Editor) {
+	if len(editor.search.results) == 0 {return}
+
+	// Check if cursor matches a result
+	current_match_idx := -1
+	for i := 0; i < len(editor.search.results); i += 1 {
+		res := editor.search.results[i]
+		if res.row == editor.cursor.row && res.col == editor.cursor.col {
+			current_match_idx = i
+			break
+		}
+	}
+
+	if current_match_idx != -1 {
+		// Calculate end cursor for deletion
+		query := strings.to_string(editor.search.query)
+		start := editor.search.results[current_match_idx]
+
+		// End cursor calculation (utf8 aware)
+		lines := strings.split(query, "\n", context.temp_allocator)
+		end_row := start.row + len(lines) - 1
+		end_col := 0
+		if len(lines) == 1 {
+			end_col = start.col + utf8.rune_count(query)
+		} else {
+			end_col = utf8.rune_count(lines[len(lines) - 1])
+		}
+
+		end := Cursor{end_row, end_col, 0}
+
+		// Delete match
+		delete_range(editor, start, end)
+
+		// Insert replacement
+		replace_text := strings.to_string(editor.search.replace_query)
+		insert_text(editor, replace_text)
+
+		// Re-run search to update indices
+		perform_search(editor)
+
+		// Move to next result
+		jump_to_next_result(editor)
+	} else {
+		// Just move to next if not on match
+		jump_to_next_result(editor)
+	}
+}
+
+perform_search :: proc(editor: ^Editor) {
+	clear(&editor.search.results)
+	query := strings.to_string(editor.search.query)
+	if len(query) == 0 {return}
+
+	for i := 0; i < len(editor.lines); i += 1 {
+		line := editor.lines[i]
+		// Optimization: Check if line contains first rune of query?
+		// For now, simple conversion
+		line_str := utf8.runes_to_string(line[:], context.temp_allocator)
+
+		start_idx := 0
+		for {
+			idx := strings.index(line_str[start_idx:], query)
+			if idx == -1 {break}
+
+			real_idx := start_idx + idx
+			// Convert byte index to rune index (column)
+			col := utf8.rune_count(line_str[:real_idx])
+
+			append(&editor.search.results, Cursor{i, col, 0})
+			start_idx = real_idx + len(query) // Move past match
+			if start_idx >= len(line_str) {break}
+		}
+	}
+}
+
+jump_to_next_result :: proc(editor: ^Editor) {
+	if len(editor.search.results) == 0 {return}
+
+	// Find next match after current cursor
+	found := false
+	for i := 0; i < len(editor.search.results); i += 1 {
+		res := editor.search.results[i]
+		if res.row > editor.cursor.row ||
+		   (res.row == editor.cursor.row && res.col > editor.cursor.col) {
+			editor.search.current_idx = i
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		editor.search.current_idx = 0 // Wrap
+	}
+
+	target := editor.search.results[editor.search.current_idx]
+	editor.cursor.row = target.row
+	editor.cursor.col = target.col
+	editor.cursor.preferred_col = target.col
+	ensure_cursor_visible(editor)
+}
+
+jump_to_prev_result :: proc(editor: ^Editor) {
+	if len(editor.search.results) == 0 {return}
+
+	// Find prev match before current cursor
+	target_idx := len(editor.search.results) - 1
+	for i := len(editor.search.results) - 1; i >= 0; i -= 1 {
+		res := editor.search.results[i]
+		if res.row < editor.cursor.row ||
+		   (res.row == editor.cursor.row && res.col < editor.cursor.col) {
+			target_idx = i
+			break
+		}
+	}
+
+	editor.search.current_idx = target_idx
+	target := editor.search.results[target_idx]
+	editor.cursor.row = target.row
+	editor.cursor.col = target.col
+	editor.cursor.preferred_col = target.col
+	ensure_cursor_visible(editor)
 }
 
 update_selection :: proc(editor: ^Editor, is_shift: bool, old_cursor: Cursor) {
@@ -443,37 +728,40 @@ load_file :: proc(editor: ^Editor, path: string) {
 	}
 	defer delete(data)
 
-	text := string(data)
-
 	// Clear existing lines
 	for line in editor.lines {
 		delete(line)
 	}
 	clear(&editor.lines)
 
-	// Split lines
-	// Handle \r\n
-	lines_str := strings.split(text, "\n", context.temp_allocator)
+	// Stream decode
+	offset := 0
+	current_line := make([dynamic]rune)
 
-	for l in lines_str {
-		// Remove \r if present
-		line_content := l
-		if len(l) > 0 && l[len(l) - 1] == '\r' {
-			line_content = l[:len(l) - 1]
+	for offset < len(data) {
+		r, w := utf8.decode_rune(data[offset:])
+		offset += w
+
+		if r == '\r' {
+			continue
+		} else if r == '\n' {
+			append(&editor.lines, current_line)
+			current_line = make([dynamic]rune)
+		} else {
+			append(&current_line, r)
 		}
-
-		runes := utf8.string_to_runes(line_content)
-		// dynamic array creation from slice
-		d_line := make([dynamic]rune)
-		append(&d_line, ..runes)
-		append(&editor.lines, d_line)
-		delete(runes) // runes slice from string_to_runes needs to be freed?
-		// "Returns a slice of runes allocated with allocator." -> Yes.
 	}
+	// Append last line
+	append(&editor.lines, current_line)
 
 	editor.file_path = strings.clone(path)
 	editor.cursor = Cursor{0, 0, 0}
 	editor.selection.active = false
+
+	// Clear undo history
+	clear(&editor.undo_manager.undo_stack)
+	clear(&editor.undo_manager.redo_stack)
+
 	fmt.println("Loaded file:", path)
 }
 
@@ -580,6 +868,10 @@ insert_text :: proc(editor: ^Editor, text: string) {
 		delete_selection(editor)
 	}
 
+	if !editor.undo_manager.is_undoing {
+		record_action(editor, .Insert, editor.cursor, text)
+	}
+
 	lines_str := strings.split(text, "\n", context.temp_allocator)
 
 	for i := 0; i < len(lines_str); i += 1 {
@@ -598,7 +890,7 @@ insert_text :: proc(editor: ^Editor, text: string) {
 		}
 
 		if i < len(lines_str) - 1 {
-			insert_newline(editor)
+			insert_newline_internal(editor)
 		}
 	}
 	editor.cursor.preferred_col = editor.cursor.col
@@ -606,6 +898,13 @@ insert_text :: proc(editor: ^Editor, text: string) {
 }
 
 insert_newline :: proc(editor: ^Editor) {
+	if !editor.undo_manager.is_undoing {
+		record_action(editor, .Insert, editor.cursor, "\n")
+	}
+	insert_newline_internal(editor)
+}
+
+insert_newline_internal :: proc(editor: ^Editor) {
 	editor.dirty = true
 	if editor.selection.active {
 		delete_selection(editor)
@@ -633,6 +932,30 @@ insert_newline :: proc(editor: ^Editor) {
 }
 
 delete_char_backwards :: proc(editor: ^Editor) {
+	if !editor.undo_manager.is_undoing {
+		// Record deletion
+		if editor.cursor.col > 0 {
+			line := editor.lines[editor.cursor.row]
+			if editor.cursor.col - 1 < len(line) {
+				char := line[editor.cursor.col - 1]
+				text := utf8.runes_to_string([]rune{char}, context.temp_allocator)
+				record_action(
+					editor,
+					.Delete,
+					Cursor{editor.cursor.row, editor.cursor.col - 1, 0},
+					text,
+				)
+			}
+		} else if editor.cursor.row > 0 {
+			record_action(
+				editor,
+				.Delete,
+				Cursor{editor.cursor.row - 1, len(editor.lines[editor.cursor.row - 1]), 0},
+				"\n",
+			)
+		}
+	}
+
 	if editor.cursor.col > 0 {
 		editor.dirty = true
 		// Remove char at col-1
@@ -673,39 +996,167 @@ delete_selection :: proc(editor: ^Editor) {
 		e = temp
 	}
 
-	if s.row == e.row {
-		line := &editor.lines[s.row]
-		// Count of chars to remove: e.col - s.col
-		// Remove from s.col to e.col-1
-		count := e.col - s.col
-		for i := 0; i < count; i += 1 {
-			ordered_remove(line, s.col)
-		}
-	} else {
-		// Multi-line delete
-
-		// 1. Truncate start line to s.col
-		start_line := &editor.lines[s.row]
-		resize(start_line, s.col)
-
-		// 2. Append suffix of end line
-		end_line := editor.lines[e.row]
-		if e.col < len(end_line) {
-			append(start_line, ..end_line[e.col:])
-		}
-
-		// 3. Remove intermediate lines (s.row+1 to e.row inclusive)
-		// We remove from index e.row down to s.row+1 to avoid shifting issues
-		for i := e.row; i > s.row; i -= 1 {
-			delete(editor.lines[i]) // Free memory of inner array
-			ordered_remove(&editor.lines, i)
-		}
+	if !editor.undo_manager.is_undoing {
+		text := get_text_in_range(editor, s, e)
+		record_action(editor, .Delete, s, text)
+		delete(text) // record_action clones it
 	}
+
+	delete_range(editor, s, e)
 
 	editor.cursor = s
 	editor.cursor.preferred_col = s.col
 	editor.selection.active = false
 	ensure_cursor_visible(editor)
+}
+
+// Helpers for undo/redo
+
+delete_range :: proc(editor: ^Editor, s, e: Cursor) {
+	if s.row == e.row {
+		line := &editor.lines[s.row]
+		count := e.col - s.col
+		if count > 0 && s.col < len(line) {
+			end_idx := min(e.col, len(line))
+			// Use ordered_remove in loop or just slice
+			// Slicing is faster for large chunks
+			// But dynamic array remove is tricky
+			// ordered_remove shifts every time.
+			// Better: remove range logic manually
+			remove_range(line, s.col, end_idx)
+		}
+	} else {
+		// Multi-line delete
+		start_line := &editor.lines[s.row]
+		resize(start_line, s.col)
+
+		end_line := editor.lines[e.row]
+		if e.col < len(end_line) {
+			append(start_line, ..end_line[e.col:])
+		}
+
+		for i := e.row; i > s.row; i -= 1 {
+			delete(editor.lines[i])
+			ordered_remove(&editor.lines, i)
+		}
+	}
+}
+
+get_text_in_range :: proc(editor: ^Editor, s, e: Cursor) -> string {
+	builder: strings.Builder
+	strings.builder_init(&builder, context.allocator) // Use main allocator, caller frees
+
+	for r := s.row; r <= e.row; r += 1 {
+		line := editor.lines[r]
+		c_start := 0
+		if r == s.row {c_start = s.col}
+		c_end := len(line)
+		if r == e.row {c_end = e.col}
+
+		if c_end > len(line) {c_end = len(line)}
+		if c_start > len(line) {c_start = len(line)}
+
+		if c_start < c_end {
+			str := utf8.runes_to_string(line[c_start:c_end], context.temp_allocator)
+			strings.write_string(&builder, str)
+		}
+
+		if r != e.row {
+			strings.write_byte(&builder, '\n')
+		}
+	}
+	return strings.to_string(builder)
+}
+
+record_action :: proc(editor: ^Editor, type: ActionType, start: Cursor, text: string) {
+	// Clear redo stack
+	for action in editor.undo_manager.redo_stack {
+		delete(action.text)
+	}
+	clear(&editor.undo_manager.redo_stack)
+
+	// Grouping logic (simplified: merge sequential inserts)
+	/*
+	if type == .Insert && len(editor.undo_manager.undo_stack) > 0 {
+		last_action := &editor.undo_manager.undo_stack[len(editor.undo_manager.undo_stack) - 1]
+		// Check if last action was insert and happened recently (e.g. < 500ms)
+		// And check if positions are contiguous
+		// For now, simple grouping by type and adjacency
+		// Actually, let's keep it simple: no grouping first to ensure correctness
+	}
+	*/
+
+	action := Action {
+		type      = type,
+		start     = start,
+		text      = strings.clone(text),
+		timestamp = sdl.GetTicks(),
+	}
+	append(&editor.undo_manager.undo_stack, action)
+}
+
+undo :: proc(editor: ^Editor) {
+	if len(editor.undo_manager.undo_stack) == 0 {return}
+
+	action := pop(&editor.undo_manager.undo_stack)
+	editor.undo_manager.is_undoing = true
+	defer editor.undo_manager.is_undoing = false
+
+	editor.cursor = action.start
+	// Reverse action
+	switch action.type {
+	case .Insert:
+		// Undo Insert -> Delete
+		// Calculate end position based on text
+		lines := strings.split(action.text, "\n", context.temp_allocator)
+		end_row := action.start.row + len(lines) - 1
+		end_col := 0
+		if len(lines) == 1 {
+			end_col = action.start.col + len(lines[0]) // utf8 length? No, bytes. Wait.
+			// cursor is in runes. len(string) is bytes.
+			// We need rune count.
+			end_col = action.start.col + utf8.rune_count(action.text)
+		} else {
+			end_col = utf8.rune_count(lines[len(lines) - 1])
+		}
+
+		delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+
+	case .Delete:
+		// Undo Delete -> Insert
+		insert_text(editor, action.text)
+	}
+
+	append(&editor.undo_manager.redo_stack, action)
+}
+
+redo :: proc(editor: ^Editor) {
+	if len(editor.undo_manager.redo_stack) == 0 {return}
+
+	action := pop(&editor.undo_manager.redo_stack)
+	editor.undo_manager.is_undoing = true
+	defer editor.undo_manager.is_undoing = false
+
+	editor.cursor = action.start
+	// Re-do action
+	switch action.type {
+	case .Insert:
+		insert_text(editor, action.text)
+	case .Delete:
+		// Delete text again
+		// Need end cursor
+		lines := strings.split(action.text, "\n", context.temp_allocator)
+		end_row := action.start.row + len(lines) - 1
+		end_col := 0
+		if len(lines) == 1 {
+			end_col = action.start.col + utf8.rune_count(action.text)
+		} else {
+			end_col = utf8.rune_count(lines[len(lines) - 1])
+		}
+		delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+	}
+
+	append(&editor.undo_manager.undo_stack, action)
 }
 
 move_cursor :: proc(editor: ^Editor, d_row, d_col: int) {
@@ -768,19 +1219,26 @@ ensure_cursor_visible :: proc(editor: ^Editor) {
 	}
 
 	// Auto-Scroll X
-	cursor_x := f32(editor.cursor.col) * editor.config.char_width + TEXT_MARGIN
-	if cursor_x < editor.scroll.target_x {
-		editor.scroll.target_x = cursor_x - TEXT_MARGIN
+	// Logic in content coordinates
+	start_x := get_text_start_x(editor)
+	viewport_w := f32(w) - start_x
+
+	cursor_content_x := f32(editor.cursor.col) * editor.config.char_width
+
+	if cursor_content_x < editor.scroll.target_x {
+		editor.scroll.target_x = cursor_content_x
 	}
-	if cursor_x >
-	   editor.scroll.target_x + f32(w) - editor.config.char_width - (TEXT_MARGIN * 2.0) {
-		editor.scroll.target_x = cursor_x - f32(w) + editor.config.char_width + (TEXT_MARGIN * 2.0)
+	if cursor_content_x >
+	   editor.scroll.target_x + viewport_w - editor.config.char_width - TEXT_MARGIN {
+		editor.scroll.target_x =
+			cursor_content_x - viewport_w + editor.config.char_width + TEXT_MARGIN
 	}
 }
 
 update :: proc(editor: ^Editor) {
 	current_tick := sdl.GetTicks()
 	dt := f32(current_tick - editor.last_tick) / 1000.0
+	if dt > 0.05 {dt = 0.05}
 	editor.last_tick = current_tick
 
 	// Smooth scroll
@@ -828,14 +1286,23 @@ render_line :: proc(editor: ^Editor, line_index: int, y: f32) {
 	line := editor.lines[line_index]
 	if len(line) == 0 {return}
 
-	current_x := TEXT_MARGIN - editor.scroll.x
+	start_x := get_text_start_x(editor)
+	current_x := start_x - editor.scroll.x
 	tab_width_px := f32(editor.config.tab_width) * editor.config.char_width
+
+	w_win, _: i32
+	sdl.GetWindowSize(editor.window, &w_win, nil)
+	screen_width := f32(w_win)
 
 	// Render line segment by segment
 	seg_builder: strings.Builder
 	strings.builder_init(&seg_builder, context.temp_allocator)
+	seg_runes := 0
 
 	for r_idx := 0; r_idx < len(line); r_idx += 1 {
+		// Culling
+		if current_x > screen_width {break}
+
 		r := line[r_idx]
 		if r == '\t' {
 			// Flush segment
@@ -856,15 +1323,39 @@ render_line :: proc(editor: ^Editor, line_index: int, y: f32) {
 					ttf.DestroyText(text_obj)
 				}
 				strings.builder_reset(&seg_builder)
+				seg_runes = 0
 			}
 
 			// Advance tab
 			// Rel x from start of line content (ignoring scroll for alignment)
-			line_start_x := TEXT_MARGIN - editor.scroll.x
+			line_start_x := start_x - editor.scroll.x
 			rel_x := current_x - line_start_x
 			current_x = line_start_x + next_tab_stop(rel_x, tab_width_px)
 		} else {
+			if strings.builder_len(seg_builder) == 0 && current_x + editor.config.char_width < 0 {
+				current_x += editor.config.char_width
+				continue
+			}
+
 			strings.write_rune(&seg_builder, r)
+			seg_runes += 1
+			if current_x + f32(seg_runes) * editor.config.char_width > screen_width {
+				// Flush and stop
+				text := strings.to_string(seg_builder)
+				c_text := strings.clone_to_cstring(text, context.temp_allocator)
+				text_obj := ttf.CreateText(
+					editor.text_engine,
+					editor.font,
+					c_text,
+					uint(len(text)),
+				)
+				if text_obj != nil {
+					ttf.SetTextColor(text_obj, 220, 220, 220, 255)
+					ttf.DrawRendererText(text_obj, current_x, y)
+					ttf.DestroyText(text_obj)
+				}
+				return
+			}
 		}
 	}
 
@@ -908,7 +1399,7 @@ render :: proc(editor: ^Editor) {
 	}
 
 	// Draw Cursor
-	cursor_x: f32 = TEXT_MARGIN - editor.scroll.x
+	cursor_x: f32 = get_text_start_x(editor) - editor.scroll.x
 	if len(editor.lines) > editor.cursor.row {
 		line := editor.lines[editor.cursor.row]
 		width := measure_line_width(line, editor.cursor.col, editor.config)
@@ -920,5 +1411,142 @@ render :: proc(editor: ^Editor) {
 	cursor_rect := sdl.FRect{cursor_x, cursor_y, 2.0, f32(editor.config.line_height)}
 	sdl.RenderFillRect(editor.renderer, &cursor_rect)
 
+	// Draw Gutter
+	gutter_width := get_gutter_width(editor)
+	sdl.SetRenderDrawColor(editor.renderer, 40, 40, 40, 255)
+	gutter_rect := sdl.FRect{0, 0, gutter_width, f32(h_win)}
+	sdl.RenderFillRect(editor.renderer, &gutter_rect)
+
+	// Draw line numbers
+	for i := start_line; i < end_line; i += 1 {
+		line_num_str := fmt.tprintf("%d", i + 1)
+		c_str := strings.clone_to_cstring(line_num_str, context.temp_allocator)
+
+		text_obj := ttf.CreateText(editor.text_engine, editor.font, c_str, 0)
+		if text_obj != nil {
+			ttf.SetTextColor(text_obj, 120, 120, 120, 255)
+
+			// Right align
+			num_len := f32(len(line_num_str))
+			// Or calculate exact width? Monospace assumption:
+			num_width := num_len * editor.config.char_width
+
+			x_pos := gutter_width - num_width - 10.0 // 10px padding from right of gutter
+			y_pos := f32(i) * f32(editor.config.line_height) - editor.scroll.y
+
+			ttf.DrawRendererText(text_obj, x_pos, y_pos)
+			ttf.DestroyText(text_obj)
+		}
+	}
+
+	if editor.search.active {
+		draw_search_highlights(editor, start_line, end_line)
+		draw_search_bar(editor)
+	}
+
 	sdl.RenderPresent(editor.renderer)
+}
+
+draw_search_highlights :: proc(editor: ^Editor, view_start, view_end: int) {
+	if len(editor.search.results) == 0 {return}
+
+	sdl.SetRenderDrawColor(editor.renderer, 100, 100, 0, 100) // Yellowish
+	sdl.SetRenderDrawBlendMode(editor.renderer, {.BLEND})
+
+	query := strings.to_string(editor.search.query)
+	q_len := utf8.rune_count(query)
+	start_x := get_text_start_x(editor)
+
+	for res in editor.search.results {
+		if res.row < view_start || res.row >= view_end {continue}
+
+		line := editor.lines[res.row]
+		// Measure x pos
+		x_start := measure_line_width(line, res.col, editor.config)
+		x_end := measure_line_width(line, res.col + q_len, editor.config)
+
+		x := start_x - editor.scroll.x + x_start
+		width := x_end - x_start
+		y := f32(res.row) * f32(editor.config.line_height) - editor.scroll.y
+
+		rect := sdl.FRect{x, y, width, f32(editor.config.line_height)}
+		sdl.RenderFillRect(editor.renderer, &rect)
+	}
+	sdl.SetRenderDrawBlendMode(editor.renderer, {})
+}
+
+draw_search_bar :: proc(editor: ^Editor) {
+	w, h: i32
+	sdl.GetWindowSize(editor.window, &w, &h)
+
+	bar_height := f32(30.0)
+	if editor.search.mode == .Replace {
+		bar_height = 60.0
+	}
+	y := f32(h) - bar_height
+
+	// Background
+	sdl.SetRenderDrawColor(editor.renderer, 45, 45, 50, 255)
+	rect := sdl.FRect{0, y, f32(w), bar_height}
+	sdl.RenderFillRect(editor.renderer, &rect)
+
+	// Border
+	sdl.SetRenderDrawColor(editor.renderer, 80, 80, 80, 255)
+	line_rect := sdl.FRect{0, y, f32(w), 1}
+	sdl.RenderFillRect(editor.renderer, &line_rect)
+
+	// Determine focus colors
+	find_color := sdl.Color{150, 150, 150, 255}
+	replace_color := sdl.Color{150, 150, 150, 255}
+
+	if editor.search.focus == .Query {
+		find_color = {220, 220, 220, 255}
+	} else if editor.search.focus == .ReplaceQuery {
+		replace_color = {220, 220, 220, 255}
+	}
+
+	// Find Text
+	query := strings.to_string(editor.search.query)
+	display_str := fmt.tprintf("Find: %s", query)
+	c_str := strings.clone_to_cstring(display_str, context.temp_allocator)
+
+	text_obj := ttf.CreateText(editor.text_engine, editor.font, c_str, 0)
+	if text_obj != nil {
+		ttf.SetTextColor(text_obj, find_color.r, find_color.g, find_color.b, 255)
+		ttf.DrawRendererText(text_obj, 10.0, y + 5.0)
+		ttf.DestroyText(text_obj)
+	}
+
+	// Replace Text
+	if editor.search.mode == .Replace {
+		rep_query := strings.to_string(editor.search.replace_query)
+		rep_str := fmt.tprintf("Replace: %s", rep_query)
+		c_rep := strings.clone_to_cstring(rep_str, context.temp_allocator)
+
+		rep_obj := ttf.CreateText(editor.text_engine, editor.font, c_rep, 0)
+		if rep_obj != nil {
+			ttf.SetTextColor(rep_obj, replace_color.r, replace_color.g, replace_color.b, 255)
+			ttf.DrawRendererText(rep_obj, 10.0, y + 35.0)
+			ttf.DestroyText(rep_obj)
+		}
+	}
+
+	// Match count
+	if len(editor.search.results) > 0 {
+		count_str := fmt.tprintf(
+			"%d/%d",
+			editor.search.current_idx + 1,
+			len(editor.search.results),
+		)
+		c_count := strings.clone_to_cstring(count_str, context.temp_allocator)
+		count_obj := ttf.CreateText(editor.text_engine, editor.font, c_count, 0)
+		if count_obj != nil {
+			ttf.SetTextColor(count_obj, 150, 150, 150, 255)
+			// Right align
+			w_text: i32
+			ttf.GetTextSize(count_obj, &w_text, nil)
+			ttf.DrawRendererText(count_obj, f32(w) - f32(w_text) - 10.0, y + 5.0)
+			ttf.DestroyText(count_obj)
+		}
+	}
 }
