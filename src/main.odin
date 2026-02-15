@@ -5,7 +5,9 @@ import "core:fmt"
 import "core:log"
 import "core:math"
 import "core:mem"
+import "core:nbio"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
 import sdl "vendor:sdl3"
@@ -21,6 +23,7 @@ Editor :: struct {
 	config:       Config,
 	undo_manager: UndoManager,
 	search:       SearchState,
+	command:      CommandState,
 	file_path:    string,
 	dirty:        bool, // Has unsaved changes?
 
@@ -61,19 +64,23 @@ Config :: struct {
 ActionType :: enum {
 	Insert,
 	Delete,
+	Replace,
 }
 
 Action :: struct {
-	type:      ActionType,
-	start:     Cursor,
-	text:      string,
-	timestamp: u64,
+	type:          ActionType,
+	start:         Cursor,
+	text:          string,
+	original_text: string,
+	timestamp:     u64,
+	chained:       bool,
 }
 
 UndoManager :: struct {
 	undo_stack: [dynamic]Action,
 	redo_stack: [dynamic]Action,
 	is_undoing: bool,
+	chain_next: bool,
 }
 
 SearchState :: struct {
@@ -96,7 +103,32 @@ SearchFocus :: enum {
 	ReplaceQuery,
 }
 
-// Global constants
+InputMode :: enum {
+	Text,
+	Command,
+}
+
+CommandType :: enum {
+	None,
+	Find,
+	Replace,
+	ReplaceQuery,
+	GotoLine,
+	OpenFile,
+	SaveFile,
+}
+
+CommandState :: struct {
+	active:       bool,
+	mode:         InputMode,
+	type:         CommandType,
+	input:        strings.Builder,
+	prompt:       string,
+	message:      string, // Status message (e.g., "Saved")
+	message_time: u64, // Timestamp when message was set
+	preview_len:  int,
+}
+
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 600
 FONT_PATH :: "fonts/Fira_Mono/FiraMono-Regular.ttf"
@@ -125,6 +157,12 @@ main :: proc() {
 	}
 	defer sdl.Quit()
 
+	if err := nbio.acquire_thread_event_loop(); err != .None {
+		fmt.eprintln("NBIO Init failed:", err)
+		return
+	}
+	defer nbio.release_thread_event_loop()
+
 	if !ttf.Init() {
 		fmt.eprintln("TTF_Init failed")
 		return
@@ -142,8 +180,10 @@ main :: proc() {
 
 	strings.builder_init(&editor.search.query)
 	strings.builder_init(&editor.search.replace_query)
+	strings.builder_init(&editor.command.input)
 	defer strings.builder_destroy(&editor.search.query)
 	defer strings.builder_destroy(&editor.search.replace_query)
+	defer strings.builder_destroy(&editor.command.input)
 	defer delete(editor.search.results)
 
 	// Initialize Window and Renderer
@@ -206,6 +246,7 @@ main :: proc() {
 	// Main Loop
 	running := true
 	for running {
+		nbio.tick(0)
 		frame_start := sdl.GetTicks()
 
 		event: sdl.Event
@@ -288,45 +329,11 @@ draw_selection_rects :: proc(editor: ^Editor, view_start, view_end: int) {
 	sdl.SetRenderDrawColor(editor.renderer, 200, 200, 200, 255)
 }
 
-save_file_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: i32) {
-	context = runtime.default_context()
-	if filelist == nil {return}
-
-	// Create user event to handle saving on main thread
-	path_str := string(filelist[0])
-	if len(path_str) == 0 {return}
-
-	// Clone string to heap to pass safely
-	// We'll use cstring for simplicity with delete/free
-	new_cstr := strings.clone_to_cstring(path_str, context.allocator)
-
-	event: sdl.Event
-	event.type = sdl.EventType.USER
-	event.user.code = 0
-	event.user.data1 = rawptr(new_cstr)
-	_ = sdl.PushEvent(&event)
-}
-
-open_file_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: i32) {
-	context = runtime.default_context()
-	if filelist == nil {return}
-
-	path_str := string(filelist[0])
-	if len(path_str) == 0 {return}
-
-	new_cstr := strings.clone_to_cstring(path_str, context.allocator)
-
-	event: sdl.Event
-	event.type = sdl.EventType.USER
-	event.user.code = 1 // 1 for open
-	event.user.data1 = rawptr(new_cstr)
-	_ = sdl.PushEvent(&event)
-}
 
 handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
-	if editor.search.active {
+	if editor.command.active {
 		if event.type == .TEXT_INPUT || event.type == .KEY_DOWN {
-			handle_search_input(editor, event)
+			handle_command_input(editor, event)
 			return
 		}
 	}
@@ -339,24 +346,10 @@ handle_event :: proc(editor: ^Editor, event: ^sdl.Event, running: ^bool) {
 		if event.key.key == sdl.K_ESCAPE {
 			// Deselect instead of quit
 			editor.selection.active = false
+			editor.search.active = false
 		}
 		// Handle other keys
 		handle_key(editor, event.key)
-	} else if event.type == .USER {
-		// Handle file operations
-		// Code 0: Save, Code 1: Open
-		if event.user.data1 != nil {
-			c_path := cstring(event.user.data1)
-			path := string(c_path)
-
-			if event.user.code == 0 {
-				save_file(editor, path)
-			} else if event.user.code == 1 {
-				load_file(editor, path)
-			}
-
-			// mem.free(rawptr(c_path), runtime.default_allocator())
-		}
 	} else if event.type == .MOUSE_BUTTON_DOWN {
 		if event.button.button == sdl.BUTTON_LEFT {
 			click_row, click_col := screen_to_grid(editor, event.button.x, event.button.y)
@@ -496,11 +489,24 @@ handle_key :: proc(editor: ^Editor, key: sdl.KeyboardEvent) {
 			} else {
 				delete_char_backwards(editor)
 			}
+		case sdl.K_DELETE:
+			if editor.selection.active {
+				delete_selection(editor)
+			} else {
+				old_pos := editor.cursor
+				move_cursor(editor, 0, 1)
+				if old_pos != editor.cursor {
+					delete_char_backwards(editor)
+				}
+			}
 		case sdl.K_TAB:
 			insert_text(editor, "\t")
 		case sdl.K_RETURN:
-			// Enter
-			insert_newline(editor)
+			if editor.search.active && editor.search.mode == .Replace {
+				perform_replace(editor)
+			} else {
+				insert_newline(editor)
+			}
 		case sdl.K_C:
 			if is_ctrl {
 				copy_selection(editor)
@@ -511,16 +517,24 @@ handle_key :: proc(editor: ^Editor, key: sdl.KeyboardEvent) {
 			}
 		case sdl.K_O:
 			if is_ctrl {
-				sdl.ShowOpenFileDialog(open_file_callback, nil, editor.window, nil, 0, nil, false)
+				editor.command.active = true
+				editor.command.mode = .Command
+				editor.command.type = .OpenFile
+				editor.command.prompt = "Open: "
+				strings.builder_reset(&editor.command.input)
 			}
 		case sdl.K_S:
 			if is_ctrl {
 				if is_shift || len(editor.file_path) == 0 {
-					// Save As: Open dialog
-					// Pass nil for userdata as we use PushEvent
-					sdl.ShowSaveFileDialog(save_file_callback, nil, editor.window, nil, 0, nil)
+					editor.command.active = true
+					editor.command.mode = .Command
+					editor.command.type = .SaveFile
+					editor.command.prompt = "Save As: "
+					strings.builder_reset(&editor.command.input)
 				} else {
 					save_file(editor, editor.file_path)
+					editor.command.message = "Saved"
+					editor.command.message_time = sdl.GetTicks()
 				}
 			}
 		case sdl.K_Z:
@@ -537,17 +551,34 @@ handle_key :: proc(editor: ^Editor, key: sdl.KeyboardEvent) {
 			}
 		case sdl.K_F:
 			if is_ctrl {
-				editor.search.active = true
-				editor.search.mode = .Find
-				editor.search.focus = .Query
-				perform_search(editor)
+				editor.command.active = true
+				editor.command.mode = .Command
+				editor.command.type = .Find
+				editor.command.prompt = "Find: "
+				strings.builder_reset(&editor.command.input)
 			}
 		case sdl.K_H:
 			if is_ctrl {
-				editor.search.active = true
-				editor.search.mode = .Replace
-				editor.search.focus = .Query
-				perform_search(editor)
+				editor.command.active = true
+				editor.command.mode = .Command
+				editor.command.type = .Replace
+				editor.command.prompt = "Replace: "
+				strings.builder_reset(&editor.command.input)
+			}
+		case sdl.K_F3:
+			mods := sdl.GetModState()
+			if (mods & sdl.KMOD_SHIFT) != nil {
+				jump_to_prev_result(editor)
+			} else {
+				jump_to_next_result(editor)
+			}
+		case sdl.K_G:
+			if is_ctrl {
+				editor.command.active = true
+				editor.command.mode = .Command
+				editor.command.type = .GotoLine
+				editor.command.prompt = "Goto Line: "
+				strings.builder_reset(&editor.command.input)
 			}
 		case:
 		// Handle other keys
@@ -555,64 +586,134 @@ handle_key :: proc(editor: ^Editor, key: sdl.KeyboardEvent) {
 	}
 }
 
-handle_search_input :: proc(editor: ^Editor, event: ^sdl.Event) {
-	if event.type == .KEY_DOWN {
-		key := event.key.key
-		switch key {
+handle_command_input :: proc(editor: ^Editor, event: ^sdl.Event) {
+	input_changed := false
+
+	if event.type == .TEXT_INPUT {
+		text := string(event.text.text)
+		strings.write_string(&editor.command.input, text)
+		input_changed = true
+	} else if event.type == .KEY_DOWN {
+		switch event.key.key {
 		case sdl.K_ESCAPE:
-			editor.search.active = false
+			editor.command.active = false
 			editor.window_focus = true // Restore focus
+			if editor.command.type == .Find ||
+			   editor.command.type == .Replace ||
+			   editor.command.type == .ReplaceQuery {
+				editor.search.active = false
+			}
 		case sdl.K_BACKSPACE:
-			builder := &editor.search.query
-			if editor.search.focus == .ReplaceQuery {
-				builder = &editor.search.replace_query
-			}
-			if strings.builder_len(builder^) > 0 {
-				// Remove last rune
-				str := strings.to_string(builder^)
+			if strings.builder_len(editor.command.input) > 0 {
+				// Proper utf8 backspace
+				str := strings.to_string(editor.command.input)
 				_, w := utf8.decode_last_rune(str)
-				// Rebuild without last char
-				// Efficient enough for search query
-				new_str := str[:len(str) - w]
-				clone := strings.clone(new_str, context.temp_allocator)
-				strings.builder_reset(builder)
-				strings.write_string(builder, clone)
-			}
-			if editor.search.focus == .Query {
-				perform_search(editor)
-			}
-		case sdl.K_TAB:
-			if editor.search.mode == .Replace {
-				if editor.search.focus == .Query {
-					editor.search.focus = .ReplaceQuery
-				} else {
-					editor.search.focus = .Query
+				for i := 0; i < w; i += 1 {
+					pop(&editor.command.input.buf)
 				}
+				input_changed = true
 			}
 		case sdl.K_RETURN:
-			if editor.search.mode == .Replace && editor.search.focus == .ReplaceQuery {
-				perform_replace(editor)
-			} else {
-				jump_to_next_result(editor)
+			if execute_command(editor) {
+				editor.command.active = false
+				editor.window_focus = true
 			}
 		case sdl.K_F3:
 			mods := sdl.GetModState()
 			if (mods & sdl.KMOD_SHIFT) != nil {
-				// Prev
 				jump_to_prev_result(editor)
 			} else {
 				jump_to_next_result(editor)
 			}
 		}
-	} else if event.type == .TEXT_INPUT {
-		text := string(event.text.text)
-		if editor.search.focus == .Query {
+	}
+
+	if input_changed {
+		if editor.command.type == .Find || editor.command.type == .Replace {
+			text := strings.to_string(editor.command.input)
+			strings.builder_reset(&editor.search.query)
 			strings.write_string(&editor.search.query, text)
-			perform_search(editor)
-		} else {
-			strings.write_string(&editor.search.replace_query, text)
+
+			if len(text) > 0 {
+				editor.search.active = true
+				if editor.command.type == .Find {
+					editor.search.mode = .Find
+				} else {
+					editor.search.mode = .Replace
+				}
+				perform_search(editor)
+				jump_to_next_result(editor)
+			} else {
+				editor.search.active = false
+			}
 		}
 	}
+}
+
+execute_command :: proc(editor: ^Editor) -> bool {
+	input := strings.to_string(editor.command.input)
+
+	switch editor.command.type {
+	case .GotoLine:
+		line_num, ok := strconv.parse_int(input)
+		if ok && line_num > 0 {
+			target_row := line_num - 1
+			if target_row < len(editor.lines) {
+				leave_line(editor, editor.cursor.row)
+				editor.cursor.row = target_row
+				editor.cursor.col = 0
+				editor.cursor.preferred_col = 0
+				ensure_cursor_visible(editor)
+			}
+		}
+	case .OpenFile:
+		if len(input) > 0 {
+			path := strings.trim_space(input)
+			if len(path) > 0 {
+				load_file(editor, path)
+			}
+		}
+	case .SaveFile:
+		if len(input) > 0 {
+			path := strings.trim_space(input)
+			if len(path) > 0 {
+				save_file(editor, path)
+				editor.command.message = "Saved"
+				editor.command.message_time = sdl.GetTicks()
+			}
+		}
+	case .Find:
+		text := strings.to_string(editor.command.input)
+		if len(text) > 0 {
+			strings.builder_reset(&editor.search.query)
+			strings.write_string(&editor.search.query, text)
+			editor.search.active = true
+			editor.search.mode = .Find
+			perform_search(editor)
+			jump_to_next_result(editor)
+		}
+	case .Replace:
+		text := strings.to_string(editor.command.input)
+		if len(text) > 0 {
+			strings.builder_reset(&editor.search.query)
+			strings.write_string(&editor.search.query, text)
+
+			editor.command.type = .ReplaceQuery
+			editor.command.prompt = "With: "
+			strings.builder_reset(&editor.command.input)
+			editor.command.preview_len = 0
+			return false
+		}
+	case .ReplaceQuery:
+		text := strings.to_string(editor.command.input)
+		strings.builder_reset(&editor.search.replace_query)
+		strings.write_string(&editor.search.replace_query, text)
+
+		perform_replace(editor)
+		return false
+	case .None:
+	}
+	return true
 }
 
 perform_replace :: proc(editor: ^Editor) {
@@ -634,33 +735,37 @@ perform_replace :: proc(editor: ^Editor) {
 		start := editor.search.results[current_match_idx]
 
 		// End cursor calculation (utf8 aware)
-		lines := strings.split(query, "\n", context.temp_allocator)
-		end_row := start.row + len(lines) - 1
-		end_col := 0
-		if len(lines) == 1 {
-			end_col = start.col + utf8.rune_count(query)
-		} else {
-			end_col = utf8.rune_count(lines[len(lines) - 1])
-		}
+		// Multi-line search not yet supported, so simple calculation
+		end_row := start.row
+		end_col := start.col + utf8.rune_count(query)
 
 		end := Cursor{end_row, end_col, 0}
 
+		// Record Replace action
+		replace_text := strings.to_string(editor.search.replace_query)
+		if !editor.undo_manager.is_undoing {
+			record_action(editor, .Replace, start, replace_text, query)
+		}
+
 		// Delete match
+		editor.cursor = start // Ensure cursor is at start
 		delete_range(editor, start, end)
 
-		// Insert replacement
-		replace_text := strings.to_string(editor.search.replace_query)
+		// Insert replacement (suppress recording)
+		was_undoing := editor.undo_manager.is_undoing
+		editor.undo_manager.is_undoing = true
 		insert_text(editor, replace_text)
+		editor.undo_manager.is_undoing = was_undoing
 
 		// Re-run search to update indices
 		perform_search(editor)
 
-		// Move to next result
-		jump_to_next_result(editor)
-	} else {
-		// Just move to next if not on match
-		jump_to_next_result(editor)
+		// Adjust index to land on the next match (which is now at current_match_idx)
+		editor.search.current_idx = current_match_idx - 1
 	}
+
+	// Move to next result
+	jump_to_next_result(editor)
 }
 
 perform_search :: proc(editor: ^Editor) {
@@ -767,13 +872,33 @@ get_char_col :: proc(line: []u8, offset: int) -> int {
 }
 
 
+LoadContext :: struct {
+	editor: ^Editor,
+	path:   string,
+}
+
 load_file :: proc(editor: ^Editor, path: string) {
-	data, err := os.read_entire_file(path, context.allocator)
-	if err != os.General_Error.None {
-		fmt.eprintln("Failed to read file:", path, "Error:", err)
-		return
+	ctx := new(LoadContext)
+	ctx.editor = editor
+	ctx.path = strings.clone(path)
+
+	nbio.read_entire_file(ctx.path, ctx, on_file_loaded)
+}
+
+on_file_loaded :: proc(user_data: rawptr, data: []u8, err: nbio.Read_Entire_File_Error) {
+	ctx := (^LoadContext)(user_data)
+	defer {
+		delete(ctx.path)
+		free(ctx)
 	}
 	defer delete(data)
+
+	if err.value != .None {
+		fmt.eprintln("Failed to read file:", ctx.path, "Error:", err.value)
+		return
+	}
+
+	editor := ctx.editor
 
 	// Clear existing lines
 	for line in editor.lines {
@@ -820,14 +945,25 @@ load_file :: proc(editor: ^Editor, path: string) {
 		append(&editor.lines, make([dynamic]u8))
 	}
 
-	editor.file_path = strings.clone(path)
+	if editor.file_path != ctx.path {
+		if len(editor.file_path) > 0 {
+			delete(editor.file_path)
+		}
+		editor.file_path = strings.clone(ctx.path)
+	}
 	editor.cursor = Cursor{0, 0, 0}
 	editor.selection.active = false
 
 	// Clear undo history
 	clear_undo_history(editor)
 
-	fmt.println("Loaded file:", path)
+	fmt.println("Loaded file:", ctx.path)
+}
+
+SaveContext :: struct {
+	editor: ^Editor,
+	path:   string,
+	data:   string,
 }
 
 save_file :: proc(editor: ^Editor, path: string) {
@@ -845,17 +981,53 @@ save_file :: proc(editor: ^Editor, path: string) {
 	}
 
 	data := strings.to_string(builder)
-	err := os.write_entire_file(path, transmute([]u8)data)
-	if err == os.General_Error.None {
-		fmt.println("Saved file:", path)
-		if editor.file_path != path {
-			delete(editor.file_path)
-			editor.file_path = strings.clone(path)
-		}
-		editor.dirty = false
-	} else {
-		fmt.eprintln("Failed to save file:", path, "Error:", err)
+
+	ctx := new(SaveContext)
+	ctx.editor = editor
+	ctx.path = strings.clone(path)
+	ctx.data = strings.clone(data)
+
+	nbio.open_poly(ctx.path, ctx, on_save_opened, {.Write, .Create, .Trunc})
+}
+
+on_save_opened :: proc(op: ^nbio.Operation, ctx: ^SaveContext) {
+	if op.open.err != .None {
+		fmt.eprintln("Async save open failed:", op.open.err)
+		delete(ctx.data)
+		delete(ctx.path)
+		free(ctx)
+		return
 	}
+
+	handle := op.open.handle
+	data_bytes := transmute([]u8)ctx.data
+
+	nbio.write_poly(handle, 0, data_bytes, ctx, on_save_written)
+}
+
+on_save_written :: proc(op: ^nbio.Operation, ctx: ^SaveContext) {
+	if op.write.err != .None {
+		fmt.eprintln("Async write failed:", op.write.err)
+	} else {
+		fmt.println("Saved file:", ctx.path)
+		if ctx.editor.file_path != ctx.path {
+			if len(ctx.editor.file_path) > 0 {
+				delete(ctx.editor.file_path)
+			}
+			ctx.editor.file_path = strings.clone(ctx.path)
+		}
+		ctx.editor.dirty = false
+		ctx.editor.command.message = "Saved"
+		ctx.editor.command.message_time = sdl.GetTicks()
+	}
+
+	nbio.close_poly(op.write.handle, ctx, on_save_closed)
+}
+
+on_save_closed :: proc(op: ^nbio.Operation, ctx: ^SaveContext) {
+	delete(ctx.data)
+	delete(ctx.path)
+	free(ctx)
 }
 
 copy_selection :: proc(editor: ^Editor) {
@@ -1136,10 +1308,17 @@ get_text_in_range :: proc(editor: ^Editor, s, e: Cursor) -> string {
 	return strings.to_string(builder)
 }
 
-record_action :: proc(editor: ^Editor, type: ActionType, start: Cursor, text: string) {
+record_action :: proc(
+	editor: ^Editor,
+	type: ActionType,
+	start: Cursor,
+	text: string,
+	original_text: string = "",
+) {
 	// Clear redo stack
 	for action in editor.undo_manager.redo_stack {
 		delete(action.text)
+		delete(action.original_text)
 	}
 	clear(&editor.undo_manager.redo_stack)
 
@@ -1155,76 +1334,124 @@ record_action :: proc(editor: ^Editor, type: ActionType, start: Cursor, text: st
 	*/
 
 	action := Action {
-		type      = type,
-		start     = start,
-		text      = strings.clone(text),
-		timestamp = sdl.GetTicks(),
+		type          = type,
+		start         = start,
+		text          = strings.clone(text),
+		original_text = strings.clone(original_text),
+		timestamp     = sdl.GetTicks(),
+		chained       = editor.undo_manager.chain_next,
 	}
+	editor.undo_manager.chain_next = false
 	append(&editor.undo_manager.undo_stack, action)
 }
 
 undo :: proc(editor: ^Editor) {
 	if len(editor.undo_manager.undo_stack) == 0 {return}
 
-	action := pop(&editor.undo_manager.undo_stack)
 	editor.undo_manager.is_undoing = true
 	defer editor.undo_manager.is_undoing = false
 
-	editor.cursor = action.start
-	// Reverse action
-	switch action.type {
-	case .Insert:
-		// Undo Insert -> Delete
-		// Calculate end position based on text
-		lines := strings.split(action.text, "\n", context.temp_allocator)
-		end_row := action.start.row + len(lines) - 1
-		end_col := 0
-		if len(lines) == 1 {
-			end_col = action.start.col + len(lines[0]) // utf8 length? No, bytes. Wait.
-			// cursor is in runes. len(string) is bytes.
-			// We need rune count.
-			end_col = action.start.col + utf8.rune_count(action.text)
-		} else {
-			end_col = utf8.rune_count(lines[len(lines) - 1])
+	for {
+		if len(editor.undo_manager.undo_stack) == 0 {break}
+		action := pop(&editor.undo_manager.undo_stack)
+
+		editor.cursor = action.start
+		// Reverse action
+		switch action.type {
+		case .Insert:
+			// Undo Insert -> Delete
+			// Calculate end position based on text
+			lines := strings.split(action.text, "\n", context.temp_allocator)
+			end_row := action.start.row + len(lines) - 1
+			end_col := 0
+			if len(lines) == 1 {
+				end_col = action.start.col + utf8.rune_count(action.text)
+			} else {
+				end_col = utf8.rune_count(lines[len(lines) - 1])
+			}
+
+			delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+
+		case .Delete:
+			// Undo Delete -> Insert
+			insert_text(editor, action.text)
+		case .Replace:
+			// Undo Replace -> Delete inserted text, Insert original text
+			// 1. Delete inserted text
+			lines := strings.split(action.text, "\n", context.temp_allocator)
+			end_row := action.start.row + len(lines) - 1
+			end_col := 0
+			if len(lines) == 1 {
+				end_col = action.start.col + utf8.rune_count(action.text)
+			} else {
+				end_col = utf8.rune_count(lines[len(lines) - 1])
+			}
+			delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+
+			// 2. Insert original text
+			insert_text(editor, action.original_text)
 		}
 
-		delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+		append(&editor.undo_manager.redo_stack, action)
 
-	case .Delete:
-		// Undo Delete -> Insert
-		insert_text(editor, action.text)
+		if !action.chained {break}
 	}
-
-	append(&editor.undo_manager.redo_stack, action)
 }
 
 redo :: proc(editor: ^Editor) {
 	if len(editor.undo_manager.redo_stack) == 0 {return}
 
-	action := pop(&editor.undo_manager.redo_stack)
 	editor.undo_manager.is_undoing = true
 	defer editor.undo_manager.is_undoing = false
 
-	editor.cursor = action.start
-	// Re-do action
-	switch action.type {
-	case .Insert:
-		insert_text(editor, action.text)
-	case .Delete:
-		// Delete text again
-		// Need end cursor
-		lines := strings.split(action.text, "\n", context.temp_allocator)
-		end_row := action.start.row + len(lines) - 1
-		end_col := 0
-		if len(lines) == 1 {
-			end_col = action.start.col + utf8.rune_count(action.text)
-		} else {
-			end_col = utf8.rune_count(lines[len(lines) - 1])
-		}
-		delete_range(editor, action.start, Cursor{end_row, end_col, 0})
-	}
+	for {
+		if len(editor.undo_manager.redo_stack) == 0 {break}
+		action := pop(&editor.undo_manager.redo_stack)
 
-	append(&editor.undo_manager.undo_stack, action)
+		editor.cursor = action.start
+		// Re-do action
+		switch action.type {
+		case .Insert:
+			insert_text(editor, action.text)
+		case .Delete:
+			// Delete text again
+			// Need end cursor
+			lines := strings.split(action.text, "\n", context.temp_allocator)
+			end_row := action.start.row + len(lines) - 1
+			end_col := 0
+			if len(lines) == 1 {
+				end_col = action.start.col + utf8.rune_count(action.text)
+			} else {
+				end_col = utf8.rune_count(lines[len(lines) - 1])
+			}
+			delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+		case .Replace:
+			// Redo Replace -> Delete original text, Insert new text
+			// 1. Delete original text
+			lines := strings.split(action.original_text, "\n", context.temp_allocator)
+			end_row := action.start.row + len(lines) - 1
+			end_col := 0
+			if len(lines) == 1 {
+				end_col = action.start.col + utf8.rune_count(action.original_text)
+			} else {
+				end_col = utf8.rune_count(lines[len(lines) - 1])
+			}
+			delete_range(editor, action.start, Cursor{end_row, end_col, 0})
+
+			// 2. Insert new text
+			insert_text(editor, action.text)
+		}
+
+		append(&editor.undo_manager.undo_stack, action)
+
+		// Check if next action in redo stack is chained to this one (chained=true)
+		if len(editor.undo_manager.redo_stack) > 0 {
+			next_op := editor.undo_manager.redo_stack[len(editor.undo_manager.redo_stack) - 1]
+			if !next_op.chained {break}
+		} else {
+			break
+		}
+	}
 }
 
 move_cursor :: proc(editor: ^Editor, d_row, d_col: int) {
@@ -1482,6 +1709,87 @@ render_line :: proc(editor: ^Editor, line_index: int, y: f32) {
 	}
 }
 
+render_status_bar :: proc(editor: ^Editor) {
+	w, h: i32
+	sdl.GetWindowSize(editor.window, &w, &h)
+
+	bar_height := f32(30.0)
+	y := f32(h) - bar_height
+
+	// Background
+	sdl.SetRenderDrawColor(editor.renderer, 35, 35, 40, 255)
+	rect := sdl.FRect{0, y, f32(w), bar_height}
+	sdl.RenderFillRect(editor.renderer, &rect)
+
+	// Border
+	sdl.SetRenderDrawColor(editor.renderer, 60, 60, 60, 255)
+	line_rect := sdl.FRect{0, y, f32(w), 1}
+	sdl.RenderFillRect(editor.renderer, &line_rect)
+
+	// Content
+	text_y := y + 5.0
+
+	// Left side: Mode/Command/Message
+	left_text := ""
+	if editor.command.active {
+		left_text = fmt.tprintf(
+			"%s%s",
+			editor.command.prompt,
+			strings.to_string(editor.command.input),
+		)
+	} else if len(editor.command.message) > 0 &&
+	   (sdl.GetTicks() - editor.command.message_time) < 3000 {
+		left_text = editor.command.message
+	}
+
+	if len(left_text) > 0 {
+		c_str := strings.clone_to_cstring(left_text, context.temp_allocator)
+		text_obj := ttf.CreateText(editor.text_engine, editor.font, c_str, 0)
+		if text_obj != nil {
+			ttf.SetTextColor(text_obj, 220, 220, 220, 255)
+			ttf.DrawRendererText(text_obj, 10.0, text_y)
+
+			if editor.command.active {
+				w_text: i32
+				ttf.GetTextSize(text_obj, &w_text, nil)
+				cursor_x := 10.0 + f32(w_text)
+				cursor_rect := sdl.FRect{cursor_x, text_y, 2.0, f32(editor.config.line_height)}
+				sdl.SetRenderDrawColor(editor.renderer, 200, 200, 200, 255)
+				sdl.RenderFillRect(editor.renderer, &cursor_rect)
+			}
+
+			ttf.DestroyText(text_obj)
+		}
+	}
+
+	// Right side: Cursor position, File info
+	dirty_marker := ""
+	if editor.dirty {dirty_marker = "[+]"}
+
+	right_text := fmt.tprintf(
+		"%s  Ln %d/%d Col %d  %s",
+		editor.file_path,
+		editor.cursor.row + 1,
+		len(editor.lines),
+		editor.cursor.col + 1,
+		dirty_marker,
+	)
+
+	if len(right_text) > 0 {
+		c_str := strings.clone_to_cstring(right_text, context.temp_allocator)
+		text_obj := ttf.CreateText(editor.text_engine, editor.font, c_str, 0)
+		if text_obj != nil {
+			ttf.SetTextColor(text_obj, 150, 150, 150, 255)
+
+			w_text: i32
+			ttf.GetTextSize(text_obj, &w_text, nil)
+
+			ttf.DrawRendererText(text_obj, f32(w) - f32(w_text) - 10.0, text_y)
+			ttf.DestroyText(text_obj)
+		}
+	}
+}
+
 render :: proc(editor: ^Editor) {
 	sdl.SetRenderDrawColor(editor.renderer, 30, 30, 30, 255) // Dark background
 	sdl.RenderClear(editor.renderer)
@@ -1551,8 +1859,9 @@ render :: proc(editor: ^Editor) {
 
 	if editor.search.active {
 		draw_search_highlights(editor, start_line, end_line)
-		draw_search_bar(editor)
 	}
+
+	render_status_bar(editor)
 
 	sdl.RenderPresent(editor.renderer)
 }
@@ -1585,90 +1894,17 @@ draw_search_highlights :: proc(editor: ^Editor, view_start, view_end: int) {
 	sdl.SetRenderDrawBlendMode(editor.renderer, {})
 }
 
-draw_search_bar :: proc(editor: ^Editor) {
-	w, h: i32
-	sdl.GetWindowSize(editor.window, &w, &h)
-
-	bar_height := f32(30.0)
-	if editor.search.mode == .Replace {
-		bar_height = 60.0
-	}
-	y := f32(h) - bar_height
-
-	// Background
-	sdl.SetRenderDrawColor(editor.renderer, 45, 45, 50, 255)
-	rect := sdl.FRect{0, y, f32(w), bar_height}
-	sdl.RenderFillRect(editor.renderer, &rect)
-
-	// Border
-	sdl.SetRenderDrawColor(editor.renderer, 80, 80, 80, 255)
-	line_rect := sdl.FRect{0, y, f32(w), 1}
-	sdl.RenderFillRect(editor.renderer, &line_rect)
-
-	// Determine focus colors
-	find_color := sdl.Color{150, 150, 150, 255}
-	replace_color := sdl.Color{150, 150, 150, 255}
-
-	if editor.search.focus == .Query {
-		find_color = {220, 220, 220, 255}
-	} else if editor.search.focus == .ReplaceQuery {
-		replace_color = {220, 220, 220, 255}
-	}
-
-	// Find Text
-	query := strings.to_string(editor.search.query)
-	display_str := fmt.tprintf("Find: %s", query)
-	c_str := strings.clone_to_cstring(display_str, context.temp_allocator)
-
-	text_obj := ttf.CreateText(editor.text_engine, editor.font, c_str, 0)
-	if text_obj != nil {
-		ttf.SetTextColor(text_obj, find_color.r, find_color.g, find_color.b, 255)
-		ttf.DrawRendererText(text_obj, 10.0, y + 5.0)
-		ttf.DestroyText(text_obj)
-	}
-
-	// Replace Text
-	if editor.search.mode == .Replace {
-		rep_query := strings.to_string(editor.search.replace_query)
-		rep_str := fmt.tprintf("Replace: %s", rep_query)
-		c_rep := strings.clone_to_cstring(rep_str, context.temp_allocator)
-
-		rep_obj := ttf.CreateText(editor.text_engine, editor.font, c_rep, 0)
-		if rep_obj != nil {
-			ttf.SetTextColor(rep_obj, replace_color.r, replace_color.g, replace_color.b, 255)
-			ttf.DrawRendererText(rep_obj, 10.0, y + 35.0)
-			ttf.DestroyText(rep_obj)
-		}
-	}
-
-	// Match count
-	if len(editor.search.results) > 0 {
-		count_str := fmt.tprintf(
-			"%d/%d",
-			editor.search.current_idx + 1,
-			len(editor.search.results),
-		)
-		c_count := strings.clone_to_cstring(count_str, context.temp_allocator)
-		count_obj := ttf.CreateText(editor.text_engine, editor.font, c_count, 0)
-		if count_obj != nil {
-			ttf.SetTextColor(count_obj, 150, 150, 150, 255)
-			// Right align
-			w_text: i32
-			ttf.GetTextSize(count_obj, &w_text, nil)
-			ttf.DrawRendererText(count_obj, f32(w) - f32(w_text) - 10.0, y + 5.0)
-			ttf.DestroyText(count_obj)
-		}
-	}
-}
 
 clear_undo_history :: proc(editor: ^Editor) {
 	for action in editor.undo_manager.undo_stack {
 		delete(action.text)
+		delete(action.original_text)
 	}
 	clear(&editor.undo_manager.undo_stack)
 
 	for action in editor.undo_manager.redo_stack {
 		delete(action.text)
+		delete(action.original_text)
 	}
 	clear(&editor.undo_manager.redo_stack)
 }

@@ -531,3 +531,96 @@ Implemented memory tracking tools to debug memory usage and ensure resource clea
 - Editor is performant and memory efficient.
 - Codebase is clean and instrumented for debugging.
 - Ready for Version 0.3 planning.
+
+## VERSION 0.3
+## VERSION 0.3
+ ### Goals
+  1. Switch to `core:nbio` for asynchronous file handling.
+  2. Implement a versatile Status Bar.
+  3. Unify command inputs (Search, Goto, Open, Save) into the Status Bar.
+  4. Replace native file dialogs with command-based input.
+  5. Implement Goto Line (Ctrl+G).
+
+ ### Implementation Details
+  #### 1. Async File I/O with core:nbio
+   Integration [structs/init]
+    Import `core:nbio`
+    Initialize event loop `nbio.acquire_thread_event_loop()`
+    Add `nbio.tick()` to main loop
+   Loading
+    `load_file_async(path)` triggers `nbio.open`
+    Callbacks: `on_open` -> `nbio.read` -> `on_read_complete` -> `parse_buffer`
+   Saving
+    `save_file_async(path)` triggers `nbio.open` (Write/Create/Trunc)
+    Callbacks: `on_open` -> `nbio.write` -> `on_write_complete` -> `nbio.close`
+
+  #### 2. Status Bar & Command System
+   Data Structures
+    InputMode enum [Text, Command]
+    CommandType enum [None, Find, Replace, GotoLine, OpenFile, SaveFile]
+    CommandState struct
+     active bool
+     type CommandType
+     input strings.Builder
+     prompt string
+     message string (for status updates like "Saved")
+     message_time u64
+   Rendering
+    `render_status_bar` function
+    Layout: Prompt/Input (Left), Cursor/File Info (Right)
+   Input Handling
+    Route keys to `handle_command_input` when in Command mode
+
+  #### 3. Features
+   Goto Line (Ctrl+G)
+    Prompt: "Goto Line: "
+    Action: Parse int, validate, update cursor.row
+   File Operations
+    Open (Ctrl+O): Prompt "Open: ", trigger async load
+    Save (Ctrl+S): If path exists, save. Else prompt "Save As: "
+   Search/Replace
+    Refactor to use Status Bar input instead of overlay
+
+ ### Plan Steps
+  1. **UI & Infrastructure**: Implement `CommandState` and `render_status_bar`. ✓
+  2. **Command Input**: Implement input handling for the status bar (Enter to submit, Esc to cancel). ✓
+  3. **Goto Line**: Implement Ctrl+G using the new system. ✓
+  4. **NBIO Integration**: Setup `nbio` loop and implement `load_file_async` / `save_file_async`. ✓
+  5. **File Commands**: Connect Ctrl+O/Ctrl+S to the async IO functions. ✓
+  6. **Search Migration**: Move Find/Replace to the status bar. ✓
+  7. **Cleanup**: Remove SDL dialogs and sync IO. ✓
+
+ ## VERSION 0.3 SUMMARY: Async I/O & Unified Commands
+  ### Overview
+   Successfully transitioned to asynchronous file I/O using `core:nbio` and implemented a command-based status bar for improved UX.
+  ### Work Completed
+   #### 1. Status Bar & Command System ✓
+    - Implemented `CommandState` and rendering.
+    - Unified input for commands (Open, Save, Find, Replace, Goto).
+    - Added instant replacement preview for better UX.
+    - Added cursor rendering in status bar.
+   #### 2. Async I/O ✓
+    - Integrated `core:nbio` event loop.
+    - Implemented non-blocking load and save operations.
+   #### 3. Cleanup & Polish ✓
+    - Removed synchronous file dialogs.
+    - Refactored Search to use the status bar.
+    - Confirmed correct memory management for async operations.
+    - Fixed undo/redo behavior for Replace operations by implementing a dedicated `Replace` action type.
+
+ ## VERSION 0.3 SUMMARY: Async I/O & Unified Commands
+  ### Overview
+   Successfully transitioned to asynchronous file I/O using `core:nbio` and implemented a command-based status bar for improved UX.
+  ### Work Completed
+   #### 1. Status Bar & Command System ✓
+    - Implemented `CommandState` and rendering.
+    - Unified input for commands (Open, Save, Find, Replace, Goto).
+    - Added instant replacement preview for better UX.
+    - Added cursor rendering in status bar.
+   #### 2. Async I/O ✓
+    - Integrated `core:nbio` event loop.
+    - Implemented non-blocking load and save operations.
+   #### 3. Cleanup & Polish ✓
+    - Removed synchronous file dialogs.
+    - Refactored Search to use the status bar.
+    - Confirmed correct memory management for async operations.
