@@ -624,3 +624,16 @@ Implemented memory tracking tools to debug memory usage and ensure resource clea
     - Removed synchronous file dialogs.
     - Refactored Search to use the status bar.
     - Confirmed correct memory management for async operations.
+
+## VERSION 0.4
+
+goals:
+1. autoindent, works both with tabs and spaces.
+2. Smart autopairs for characters like ", (, [, etc. Smart in the sense that it autopairs only if the next char is blank or \n.
+3. surround text with pair characters, instead of replace it (when selecting text)
+4. home/end to go to beginning and end of lines.
+5. ctrl+left/ctrl+right to jump words (move to next blank space or \n)
+6. expand ~ character when opening/saving files
+7. tab completion for folders/files when loading/saving files.
+8. trim empty lines after the last one not empty when saving.
+9. add empty line after last one when saving.
